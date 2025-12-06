@@ -39,6 +39,10 @@ win.set_ylabel("Depth (m)")
 win.set_colorbar_label("Power (dB)")
 # You can add a colorbar later too:
 win.add_colorbar(label="Added later")
+# Reduce empty margins similar to matplotlib.tight_layout:
+win.tight_layout(pad=1.05, auto_resize=True)  # w_pad/h_pad/rect also supported
+# Disable or keep window size fixed by turning it off or passing auto_resize=False:
+win.disable_tight_layout()
 ```
 
 Mouse/keyboard notes:

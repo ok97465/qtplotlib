@@ -255,6 +255,13 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._box_drag_start = QtCore.QPoint()
         self._mode_button: QtWidgets.QPushButton | None = None
         self._current_layout: dict[str, object] | None = None
+        self._tight_enabled = False
+        self._tight_pad = 1.08
+        self._tight_w_pad: float | None = None
+        self._tight_h_pad: float | None = None
+        self._tight_rect: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+        self._tight_auto_resize = False
+        self._tight_auto_resize_pending = False
 
     def _update_content_ratio(self) -> None:
         x_span = _axis_span(self._xaxis, self._data.shape[1], "xaxis")
@@ -324,6 +331,47 @@ class _ImageCanvas(QtWidgets.QWidget):
             self._colorbar = True
         self.update()
 
+    def tight_layout(
+        self,
+        *,
+        pad: float = 1.08,
+        w_pad: float | None = None,
+        h_pad: float | None = None,
+        rect: tuple[float, float, float, float] | None = None,
+        auto_resize: bool = True,
+    ) -> None:
+        """Enable matplotlib-like tight_layout that reduces unused margins."""
+        self._tight_enabled = True
+        self._tight_pad = float(pad)
+        self._tight_w_pad = float(w_pad) if w_pad is not None else None
+        self._tight_h_pad = float(h_pad) if h_pad is not None else None
+        self._tight_auto_resize = bool(auto_resize)
+        self._tight_auto_resize_pending = self._tight_auto_resize
+        if rect is not None:
+            if len(rect) != 4:
+                raise ValueError("rect must be a 4-tuple (left, bottom, right, top)")
+            l, b, r, t = rect
+            r = max(r, l)
+            t = max(t, b)
+            self._tight_rect = (
+                float(clip(l, 0.0, 1.0)),
+                float(clip(b, 0.0, 1.0)),
+                float(clip(r, 0.0, 1.0)),
+                float(clip(t, 0.0, 1.0)),
+            )
+        else:
+            self._tight_rect = (0.0, 0.0, 1.0, 1.0)
+        self._current_layout = None
+        self.update()
+
+    def disable_tight_layout(self) -> None:
+        """Turn off tight_layout and restore heuristic margins."""
+        self._tight_enabled = False
+        self._tight_auto_resize = False
+        self._tight_auto_resize_pending = False
+        self._current_layout = None
+        self.update()
+
     def _layout(self, fm: QtGui.QFontMetrics):
         """Compute layout rectangles and tick labels."""
         tick_len = 6
@@ -354,12 +402,61 @@ class _ImageCanvas(QtWidgets.QWidget):
         max_y_label_width = max(
             (fm.horizontalAdvance(t) for t in y_tick_labels), default=0
         )
-        margin_left = max(max_y_label_width + 10, 40)
+        pad_px = 6
+        w_pad_px = 8
+        h_pad_px = 8
+        rect_left, rect_bottom, rect_right, rect_top = 0.0, 0.0, 1.0, 1.0
+        if self._tight_enabled:
+            pad_px = max(int(round(self._tight_pad * fm.height() * 0.5)), 2)
+            w_pad_px = max(
+                int(
+                    round(
+                        (self._tight_w_pad if self._tight_w_pad is not None else self._tight_pad)
+                        * fm.height()
+                        * 0.5
+                    )
+                ),
+                2,
+            )
+            h_pad_px = max(
+                int(
+                    round(
+                        (self._tight_h_pad if self._tight_h_pad is not None else self._tight_pad)
+                        * fm.height()
+                        * 0.5
+                    )
+                ),
+                2,
+            )
+            rect_left, rect_bottom, rect_right, rect_top = self._tight_rect
 
-        tick_block = tick_len + fm.height() + 4  # tick mark + labels + small gap
-        xlabel_block = fm.height() + 6 if self._xlabel else 0  # xlabel height + gap
-        margin_bottom = tick_block + xlabel_block
-        margin_top = fm.height() * 2 if self._title else fm.height() // 2
+        xlabel_height = fm.height() if self._xlabel else 0
+        ylabel_height = fm.boundingRect(self._ylabel).height() if self._ylabel else 0
+        title_height = fm.boundingRect(self._title).height() if self._title else 0
+        cbar_label_height = (
+            fm.boundingRect(self._colorbar_label).height() if self._colorbar_label else 0
+        )
+
+        y_tick_block = tick_len + max_y_label_width
+        margin_left = y_tick_block + pad_px
+        if self._ylabel:
+            margin_left += w_pad_px + max(ylabel_height, fm.height())
+
+        tick_block = tick_len + fm.height()
+        margin_bottom = tick_block + max(pad_px // 2, 2)
+        if self._xlabel:
+            margin_bottom += h_pad_px + xlabel_height
+        if cbar_scale_text:
+            margin_bottom = max(
+                margin_bottom, tick_block + max(pad_px // 2, 2) + 2 + fm.height()
+            )
+
+        margin_top = max(pad_px // 2, 2)
+        if self._title:
+            margin_top += h_pad_px + title_height
+        else:
+            margin_top = max(margin_top, fm.height() // 3)
+
         max_cbar_label_width = max(
             (fm.horizontalAdvance(t) for t in cbar_tick_labels), default=0
         )
@@ -374,14 +471,37 @@ class _ImageCanvas(QtWidgets.QWidget):
                 + cbar_width
                 + tick_len
                 + max(max_cbar_label_width, cbar_scale_width)
-                + 10
+                + max(pad_px // 2, 2)
             )
             if self._colorbar_label:
                 margin_right = max(
-                    margin_right, cbar_gap + cbar_width + fm.height() * 3
+                    margin_right,
+                    cbar_gap
+                    + cbar_width
+                    + tick_len
+                    + max(max_cbar_label_width, cbar_scale_width)
+                    + max(w_pad_px // 2, 2)
+                    + max(cbar_label_height, fm.height()),
                 )
         else:
-            margin_right = fm.height() * 2
+            margin_right = pad_px + fm.height()
+
+        if self._tight_enabled:
+            fig_w = max(self.width(), 1)
+            fig_h = max(self.height(), 1)
+            rect_left_px = int(rect_left * fig_w)
+            rect_right_px = int((1.0 - rect_right) * fig_w)
+            rect_bottom_px = int(rect_bottom * fig_h)
+            rect_top_px = int((1.0 - rect_top) * fig_h)
+            margin_left = max(margin_left, rect_left_px)
+            margin_right = max(margin_right, rect_right_px)
+            margin_bottom = max(margin_bottom, rect_bottom_px)
+            margin_top = max(margin_top, rect_top_px)
+
+        margin_left = int(round(margin_left))
+        margin_right = int(round(margin_right))
+        margin_top = int(round(margin_top))
+        margin_bottom = int(round(margin_bottom))
 
         avail_w = max(self.width() - margin_left - margin_right, 1)
         avail_h = max(self.height() - margin_top - margin_bottom, 1)
@@ -402,7 +522,10 @@ class _ImageCanvas(QtWidgets.QWidget):
         draw_w = max(draw_w, 1)
         draw_h = max(draw_h, 1)
         draw_x = margin_left + (avail_w - draw_w) // 2
-        draw_y = margin_top + (avail_h - draw_h) // 2
+        if self._tight_enabled and self._aspect_mode == "equal":
+            draw_y = margin_top
+        else:
+            draw_y = margin_top + (avail_h - draw_h) // 2
         draw_rect = QtCore.QRect(draw_x, draw_y, draw_w, draw_h)
 
         return {
@@ -419,6 +542,7 @@ class _ImageCanvas(QtWidgets.QWidget):
             "max_cbar_label_width": max_cbar_label_width,
             "cbar_scale_width": cbar_scale_width,
             "draw_rect": draw_rect,
+            "y_tick_block": y_tick_block,
             "view_limits": {
                 "x_min": x_view_min,
                 "x_max": x_view_max,
@@ -629,6 +753,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         cbar_scale_width = layout["cbar_scale_width"]
         view_limits = layout["view_limits"]
         view_state = layout["view"]
+        y_tick_block = layout["y_tick_block"]
         margin_left, _, margin_top, margin_bottom = layout["margins"]
 
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self._render_smooth)
@@ -709,8 +834,11 @@ class _ImageCanvas(QtWidgets.QWidget):
         # Y label
         if self._ylabel:
             painter.save()
+            # Position ylabel in the extra left margin to avoid overlapping tick labels.
+            extra_left = max(margin_left - y_tick_block, 0)
+            label_center_x = draw_rect.left() - y_tick_block - extra_left / 2.0
             painter.translate(
-                draw_rect.left() - margin_left // 2,
+                label_center_x,
                 draw_rect.top() + draw_rect.height() / 2,
             )
             painter.rotate(-90)
@@ -794,6 +922,7 @@ class _ImageCanvas(QtWidgets.QWidget):
             )
         self._draw_marker(painter, layout)
         self._draw_rubber_band(painter)
+        self._auto_shrink_window(layout)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # type: ignore[override]
         """Zoom in/out with mouse wheel."""
@@ -1070,6 +1199,35 @@ class _ImageCanvas(QtWidgets.QWidget):
         painter.setBrush(QtGui.QBrush(fill_color))
         painter.drawRect(self._rubber_band)
 
+    def _auto_shrink_window(self, layout: dict[str, object]) -> None:
+        """Optionally shrink the parent window to fit content more tightly."""
+        if not (self._tight_enabled and self._tight_auto_resize_pending):
+            return
+        win = self.window()
+        if win is None:
+            return
+
+        margins = layout["margins"]
+        draw_rect: QtCore.QRect = layout["draw_rect"]
+        avail_w = self.width() - margins[0] - margins[1]
+        avail_h = self.height() - margins[2] - margins[3]
+        extra_w = max(avail_w - draw_rect.width(), 0)
+        extra_h = max(avail_h - draw_rect.height(), 0)
+        tol = 8
+        shrink_w = extra_w - tol if extra_w > tol else 0
+        shrink_h = extra_h - tol if extra_h > tol else 0
+        if shrink_w <= 0 and shrink_h <= 0:
+            self._tight_auto_resize_pending = False
+            return
+
+        frame_dx = win.width() - self.width()
+        frame_dy = win.height() - self.height()
+        new_w = max(win.width() - shrink_w, self.minimumWidth() + frame_dx)
+        new_h = max(win.height() - shrink_h, self.minimumHeight() + frame_dy)
+        if new_w < win.width() or new_h < win.height():
+            win.resize(int(new_w), int(new_h))
+        self._tight_auto_resize_pending = False
+
 
 class ImageWindow(QtWidgets.QMainWindow):
     """Basic window that displays a single 2D numpy array as an image."""
@@ -1152,6 +1310,24 @@ class ImageWindow(QtWidgets.QMainWindow):
     def set_colorbar_label(self, text: str) -> None:
         """Set colorbar label (enables colorbar if provided)."""
         self._canvas.set_colorbar_label(text)
+
+    def tight_layout(
+        self,
+        *,
+        pad: float = 1.08,
+        w_pad: float | None = None,
+        h_pad: float | None = None,
+        rect: tuple[float, float, float, float] | None = None,
+        auto_resize: bool = True,
+    ) -> None:
+        """Enable matplotlib-like tight_layout on the canvas."""
+        self._canvas.tight_layout(
+            pad=pad, w_pad=w_pad, h_pad=h_pad, rect=rect, auto_resize=auto_resize
+        )
+
+    def disable_tight_layout(self) -> None:
+        """Disable tight_layout and revert to default spacing."""
+        self._canvas.disable_tight_layout()
 
 
 def imagescqt(
