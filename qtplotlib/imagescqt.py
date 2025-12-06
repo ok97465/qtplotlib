@@ -1,5 +1,7 @@
 """Lightweight PySide6 viewer similar to MATLAB's imagesc."""
 
+from math import hypot
+
 import numpy as np
 from matplotlib import cm
 from numpy import asarray, clip, isfinite, linspace, log10, nan_to_num, ndarray, uint8
@@ -139,6 +141,25 @@ def _axis_limits(axis: ndarray | None, length: int) -> tuple[float, float, float
     return start, end, span
 
 
+def _nearest_index(value: float, axis: ndarray | None, length: int) -> int:
+    """Return nearest index for a value against an optional axis."""
+    if length <= 0:
+        return 0
+    if axis is None:
+        idx = int(round(value))
+    else:
+        idx = int(np.abs(axis - value).argmin())
+    return int(clip(idx, 0, length - 1))
+
+
+def _axis_value(axis: ndarray | None, idx: int) -> float:
+    """Return numeric axis value for an index (or index itself)."""
+    if axis is None:
+        return float(idx)
+    idx = int(clip(idx, 0, axis.size - 1))
+    return float(axis[idx])
+
+
 def _tick_values(min_val: float, max_val: float, count: int = 5) -> list[float]:
     if count <= 1:
         return [min_val]
@@ -229,6 +250,9 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._drag_start = QtCore.QPoint()
         self._view_center_start = QtCore.QPointF(0.5, 0.5)
         self._rubber_band: QtCore.QRect | None = None
+        self._markers: list[dict[str, object]] = []
+        self._drag_target: dict[str, object] | None = None  # {"kind": "marker"/"box", "idx": int}
+        self._box_drag_start = QtCore.QPoint()
         self._mode_button: QtWidgets.QPushButton | None = None
         self._current_layout: dict[str, object] | None = None
 
@@ -273,6 +297,8 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._update_content_ratio()
         self._zoom_factor = 1.0
         self._view_center = QtCore.QPointF(0.5, 0.5)
+        self._markers = []
+        self._drag_target = None
         self._current_layout = None
         self.update()
 
@@ -407,6 +433,179 @@ class _ImageCanvas(QtWidgets.QWidget):
             },
             "margins": (margin_left, margin_right, margin_top, margin_bottom),
         }
+
+    def _pixel_from_position(
+        self, pos: QtCore.QPoint, layout: dict[str, object]
+    ) -> tuple[int, int] | None:
+        """Map a widget position to the nearest data pixel index."""
+        draw_rect: QtCore.QRect = layout["draw_rect"]
+        if draw_rect.width() <= 0 or draw_rect.height() <= 0:
+            return None
+        if not draw_rect.contains(pos):
+            return None
+        view_limits: dict[str, float] = layout["view_limits"]
+        x_range = view_limits["x_max"] - view_limits["x_min"]
+        y_range = view_limits["y_max"] - view_limits["y_min"]
+        if x_range == 0 or y_range == 0:
+            return None
+
+        rel_x = (pos.x() - draw_rect.left()) / draw_rect.width()
+        rel_y = (pos.y() - draw_rect.top()) / draw_rect.height()
+        x_val = view_limits["x_min"] + rel_x * x_range
+        y_val = view_limits["y_min"] + rel_y * y_range
+        col_idx = _nearest_index(x_val, self._xaxis, self._data.shape[1])
+        row_idx = _nearest_index(y_val, self._yaxis, self._data.shape[0])
+        return col_idx, row_idx
+
+    def _add_or_move_marker(
+        self,
+        pos: QtCore.QPoint,
+        layout: dict[str, object] | None = None,
+        existing_idx: int | None = None,
+    ) -> int | None:
+        """Place marker at nearest pixel or move existing one."""
+        fm = QtGui.QFontMetrics(self.font())
+        layout = layout or self._current_layout or self._layout(fm)
+        pixel = self._pixel_from_position(pos, layout)
+        if pixel is None:
+            return None
+        if existing_idx is None:
+            marker = {
+                "index": pixel,
+                "box_offset": None,
+            }
+            self._markers.append(marker)
+            self._rubber_band = None
+            self.update()
+            return len(self._markers) - 1
+        self._markers[existing_idx]["index"] = pixel
+        self._rubber_band = None
+        self.update()
+        return existing_idx
+
+    def _marker_position(
+        self, marker: dict[str, object], layout: dict[str, object]
+    ) -> tuple[QtCore.QPointF, float, float, float] | None:
+        """Return screen position plus data/axis values for a marker."""
+        idx = marker.get("index")
+        if idx is None:
+            return None
+        col_idx, row_idx = idx
+        if not (
+            0 <= row_idx < self._data.shape[0]
+            and 0 <= col_idx < self._data.shape[1]
+        ):
+            marker["index"] = None
+            return None
+
+        view_limits: dict[str, float] = layout["view_limits"]
+        x_range = view_limits["x_max"] - view_limits["x_min"]
+        y_range = view_limits["y_max"] - view_limits["y_min"]
+        if x_range == 0 or y_range == 0:
+            return None
+
+        x_val = _axis_value(self._xaxis, col_idx)
+        y_val = _axis_value(self._yaxis, row_idx)
+        rel_x = (x_val - view_limits["x_min"]) / x_range
+        rel_y = (y_val - view_limits["y_min"]) / y_range
+        if rel_x < 0.0 or rel_x > 1.0 or rel_y < 0.0 or rel_y > 1.0:
+            return None
+
+        draw_rect: QtCore.QRect = layout["draw_rect"]
+        px = draw_rect.left() + rel_x * draw_rect.width()
+        py = draw_rect.top() + rel_y * draw_rect.height()
+        data_val = float(self._data[row_idx, col_idx])
+        return QtCore.QPointF(px, py), x_val, y_val, data_val
+
+    def _marker_box_rect(
+        self,
+        marker: dict[str, object],
+        layout: dict[str, object],
+        fm: QtGui.QFontMetrics | None = None,
+    ) -> tuple[QtCore.QRectF, QtCore.QPointF, list[str]] | None:
+        """Compute bounding rect for marker tooltip box."""
+        marker_info = self._marker_position(marker, layout)
+        if marker_info is None:
+            return None
+        marker_pos, x_val, y_val, data_val = marker_info
+        fm = fm or QtGui.QFontMetrics(self.font())
+        lines = [
+            f"x: {x_val:.4g}",
+            f"y: {y_val:.4g}",
+            f"value: {data_val:.4g}",
+        ]
+        text_width = max((fm.horizontalAdvance(t) for t in lines), default=0)
+        text_height = fm.height() * len(lines) + 10
+
+        box_offset = marker.get("box_offset")
+        if box_offset is None:
+            offset_x = 12
+            offset_y = -12
+            box_x = marker_pos.x() + offset_x
+            box_y = marker_pos.y() + offset_y - text_height
+            if box_x + text_width + 14 > self.width():
+                box_x = marker_pos.x() - offset_x - text_width - 14
+            if box_y < 0:
+                box_y = marker_pos.y() + offset_x
+            marker["box_offset"] = QtCore.QPointF(
+                box_x - marker_pos.x(), box_y - marker_pos.y()
+            )
+        else:
+            box_x = marker_pos.x() + float(box_offset.x())
+            box_y = marker_pos.y() + float(box_offset.y())
+            margin = 4.0
+            box_x = float(
+                clip(
+                    box_x,
+                    margin - (text_width + 14),
+                    self.width() - margin,
+                )
+            )
+            box_y = float(
+                clip(
+                    box_y,
+                    margin,
+                    self.height() - margin - text_height,
+                )
+            )
+            marker["box_offset"] = QtCore.QPointF(
+                box_x - marker_pos.x(), box_y - marker_pos.y()
+            )
+
+        box_rect = QtCore.QRectF(
+            box_x,
+            box_y,
+            text_width + 14,
+            text_height,
+        )
+        return box_rect, marker_pos, lines
+
+    def _marker_hit(
+        self, pos: QtCore.QPoint, layout: dict[str, object]
+    ) -> tuple[int, dict[str, object]] | None:
+        """Check if a click is close enough to any marker handle."""
+        for idx, marker in enumerate(self._markers):
+            marker_info = self._marker_position(marker, layout)
+            if marker_info is None:
+                continue
+            marker_pos, _, _, _ = marker_info
+            if hypot(pos.x() - marker_pos.x(), pos.y() - marker_pos.y()) <= 8.0:
+                return idx, marker
+        return None
+
+    def _marker_box_hit(
+        self, pos: QtCore.QPoint, layout: dict[str, object]
+    ) -> tuple[int, dict[str, object]] | None:
+        """Check if a click lands on any marker tooltip box."""
+        fm = QtGui.QFontMetrics(self.font())
+        for idx, marker in enumerate(self._markers):
+            box_info = self._marker_box_rect(marker, layout, fm)
+            if box_info is None:
+                continue
+            box_rect, _, _ = box_info
+            if box_rect.contains(pos):
+                return idx, marker
+        return None
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # type: ignore[override]
         painter = QtGui.QPainter(self)
@@ -593,6 +792,7 @@ class _ImageCanvas(QtWidgets.QWidget):
                 QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom,
                 self._title,
             )
+        self._draw_marker(painter, layout)
         self._draw_rubber_band(painter)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # type: ignore[override]
@@ -609,6 +809,42 @@ class _ImageCanvas(QtWidgets.QWidget):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
         if event.button() != QtCore.Qt.LeftButton:
             return
+        fm = QtGui.QFontMetrics(self.font())
+        layout = self._current_layout or self._layout(fm)
+
+        if event.modifiers() & QtCore.Qt.ShiftModifier:
+            idx = self._add_or_move_marker(event.pos(), layout)
+            if idx is not None:
+                self._drag_target = {"kind": "marker", "idx": idx}
+                self._dragging = False
+                event.accept()
+                return
+
+        hit_marker = self._marker_hit(event.pos(), layout)
+        if hit_marker is not None:
+            idx, _ = hit_marker
+            self._drag_target = {"kind": "marker", "idx": idx}
+            self._dragging = False
+            event.accept()
+            return
+
+        hit_box = self._marker_box_hit(event.pos(), layout)
+        if hit_box is not None:
+            idx, marker = hit_box
+            self._drag_target = {"kind": "box", "idx": idx}
+            self._dragging = False
+            self._box_drag_start = event.pos()
+            box_info = self._marker_box_rect(marker, layout, fm)
+            if box_info:
+                box_rect, marker_pos, _ = box_info
+                marker["box_offset"] = QtCore.QPointF(
+                    box_rect.left() - marker_pos.x(),
+                    box_rect.top() - marker_pos.y(),
+                )
+            event.accept()
+            return
+
+        self._drag_target = None
         self._dragging = True
         self._drag_start = event.pos()
         self._view_center_start = QtCore.QPointF(self._view_center)
@@ -616,6 +852,27 @@ class _ImageCanvas(QtWidgets.QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        if self._drag_target is not None:
+            kind = self._drag_target.get("kind")
+            idx = int(self._drag_target.get("idx", -1))
+            if 0 <= idx < len(self._markers):
+                marker = self._markers[idx]
+                if kind == "box":
+                    delta = event.pos() - self._box_drag_start
+                    current_offset: QtCore.QPointF = marker.get("box_offset") or QtCore.QPointF(
+                        0, 0
+                    )
+                    marker["box_offset"] = QtCore.QPointF(
+                        current_offset.x() + delta.x(), current_offset.y() + delta.y()
+                    )
+                    self._box_drag_start = event.pos()
+                    self.update()
+                    event.accept()
+                    return
+                if kind == "marker":
+                    self._add_or_move_marker(event.pos(), existing_idx=idx)
+                    event.accept()
+                    return
         if not self._dragging:
             return
         if self._drag_mode == "pan":
@@ -643,7 +900,13 @@ class _ImageCanvas(QtWidgets.QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
-        if event.button() != QtCore.Qt.LeftButton or not self._dragging:
+        if event.button() != QtCore.Qt.LeftButton:
+            return
+        if self._drag_target is not None:
+            self._drag_target = None
+            event.accept()
+            return
+        if not self._dragging:
             return
         self._dragging = False
         if self._drag_mode == "box" and self._rubber_band is not None:
@@ -660,13 +923,30 @@ class _ImageCanvas(QtWidgets.QWidget):
             self._drag_mode = "box" if self._drag_mode == "pan" else "pan"
             event.accept()
             return
+        if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            if self._markers:
+                self._clear_marker(target_idx=None)
+                event.accept()
+                return
         super().keyPressEvent(event)
 
     def _show_mode_menu(self, pos: QtCore.QPoint) -> None:
-        """Context menu to toggle drag mode."""
+        """Context menu to toggle drag mode or clear marker."""
+        fm = QtGui.QFontMetrics(self.font())
+        layout = self._current_layout or self._layout(fm)
         menu = QtWidgets.QMenu(self)
         pan_action = menu.addAction("Pan mode")
         box_action = menu.addAction("Box-zoom mode")
+        delete_action = None
+        hit_marker = self._marker_hit(pos, layout)
+        hit_box = self._marker_box_hit(pos, layout)
+        target_idx = None
+        if hit_marker is not None:
+            target_idx = hit_marker[0]
+        elif hit_box is not None:
+            target_idx = hit_box[0]
+        if target_idx is not None:
+            delete_action = menu.addAction("Delete marker")
         current_mode = self._drag_mode
         pan_action.setCheckable(True)
         box_action.setCheckable(True)
@@ -680,6 +960,8 @@ class _ImageCanvas(QtWidgets.QWidget):
             self._drag_mode = "pan"
         elif chosen == box_action:
             self._drag_mode = "box"
+        elif delete_action is not None and chosen == delete_action and target_idx is not None:
+            self._clear_marker(target_idx)
 
     def _apply_box_zoom(self, selection: QtCore.QRect) -> None:
         """Zoom into the selected rectangle."""
@@ -713,6 +995,69 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._zoom_factor = new_zoom
         self._view_window()
         self._current_layout = None
+
+    def _clear_marker(self, target_idx: int | None = None) -> None:
+        """Remove marker(s) and tooltips."""
+        if target_idx is None:
+            self._markers.clear()
+        else:
+            if 0 <= target_idx < len(self._markers):
+                self._markers.pop(target_idx)
+        self._drag_target = None
+        self.update()
+
+    def _draw_marker(self, painter: QtGui.QPainter, layout: dict[str, object]) -> None:
+        """Render MATLAB-style data markers and tooltips."""
+        if not self._markers:
+            return
+
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        fm = painter.fontMetrics()
+        highlight = QtGui.QColor("#d32f2f")
+
+        for marker in self._markers:
+            box_info = self._marker_box_rect(marker, layout, fm)
+            if box_info is None:
+                continue
+            box_rect, marker_pos, lines = box_info
+
+            outer_pen = QtGui.QPen(QtGui.QColor("white"))
+            outer_pen.setWidth(4)
+            painter.setPen(outer_pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawEllipse(marker_pos, 6, 6)
+
+            inner_pen = QtGui.QPen(highlight)
+            inner_pen.setWidth(2)
+            painter.setPen(inner_pen)
+            painter.drawEllipse(marker_pos, 5, 5)
+            painter.drawLine(
+                marker_pos + QtCore.QPointF(-10, 0),
+                marker_pos + QtCore.QPointF(10, 0),
+            )
+            painter.drawLine(
+                marker_pos + QtCore.QPointF(0, -10),
+                marker_pos + QtCore.QPointF(0, 10),
+            )
+
+            painter.setPen(QtGui.QPen(highlight, 1.5))
+            anchor_point = QtCore.QPointF(
+                box_rect.left() + 8, box_rect.top() + box_rect.height() / 2
+            )
+            painter.drawLine(marker_pos, anchor_point)
+
+            painter.setBrush(QtGui.QColor(255, 255, 255, 235))
+            painter.setPen(QtGui.QPen(QtGui.QColor("#444"), 1))
+            painter.drawRoundedRect(box_rect, 6, 6)
+
+            text_y = box_rect.top() + 6 + fm.ascent()
+            painter.setPen(QtGui.QPen(QtGui.QColor("#111")))
+            for line in lines:
+                painter.drawText(box_rect.left() + 6, text_y, line)
+                text_y += fm.height()
+
+        painter.restore()
 
     def _draw_rubber_band(self, painter: QtGui.QPainter) -> None:
         if self._drag_mode != "box" or self._rubber_band is None:

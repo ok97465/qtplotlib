@@ -41,6 +41,11 @@ win.set_colorbar_label("Power (dB)")
 win.add_colorbar(label="Added later")
 ```
 
+Mouse/keyboard notes:
+- `Shift` + left-click drops a MATLAB-style data marker showing x/y/value (multiple markers are allowed); drag any marker to move it (snaps to nearest sample).
+- Drag each marker's info box to reposition it; the leader line stays attached to that marker, MATLAB-style.
+- Delete a marker via `Delete`/`Backspace` (clears all markers) or right-click on a specific marker/info box and pick "Delete marker".
+
 The helper will attach to an existing Qt application (ideal for `%gui qt`). If no
 `QApplication` is running, it creates one and blocks until the window closes.
 
