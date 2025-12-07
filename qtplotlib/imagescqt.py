@@ -1,5 +1,7 @@
 """Lightweight PySide6 viewer similar to MATLAB's imagesc."""
 
+import warnings
+from dataclasses import dataclass
 from math import hypot
 
 import numpy as np
@@ -7,11 +9,32 @@ from matplotlib import cm
 from numpy import asarray, clip, isfinite, linspace, log10, nan_to_num, ndarray, uint8
 
 _COLORMAP_CACHE: dict[str, object] = {}
+_TICK_LEN = 6
+_COLORBAR_WIDTH = 16
+_COLORBAR_GAP = 10
+_MAX_ZOOM = 10.0
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
 except ImportError as exc:
     raise ImportError("PySide6 is required to use imagescqt.") from exc
+
+
+def _prepare_image_data(data: ndarray) -> ndarray:
+    """Validate and coerce incoming image data for display."""
+    arr = asarray(data)
+    if arr.ndim != 2:
+        raise ValueError(f"imagescqt expects a 2D array, got shape {arr.shape}")
+    if arr.size == 0:
+        raise ValueError("imagescqt requires a non-empty 2D array")
+    if np.iscomplexobj(arr):
+        warnings.warn(
+            "Complex data provided to imagescqt; using magnitude for display.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        arr = np.abs(arr)
+    return arr.astype(float, copy=False)
 
 
 def _normalize_data(
@@ -74,7 +97,10 @@ def _array_to_qimage(
     data: ndarray, cmap: str, vmin: float | None, vmax: float | None
 ) -> tuple[QtGui.QImage, float, float]:
     """Convert numpy array to QImage using colormap, returning limits used."""
-    norm, vmin_resolved, vmax_resolved = _normalize_data(data, vmin=vmin, vmax=vmax)
+    prepared = _prepare_image_data(data)
+    norm, vmin_resolved, vmax_resolved = _normalize_data(
+        prepared, vmin=vmin, vmax=vmax
+    )
     rgba_uint8 = _apply_colormap(norm, cmap=cmap)
     height, width = norm.shape
     image = QtGui.QImage(
@@ -201,6 +227,43 @@ def _rubber_band_colors(cmap: str) -> tuple[QtGui.QColor, QtGui.QColor]:
     return pen_color, fill_color
 
 
+@dataclass(frozen=True)
+class _ViewLimits:
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+
+
+@dataclass(frozen=True)
+class _View:
+    cx: float
+    cy: float
+    width_frac: float
+    height_frac: float
+
+
+@dataclass(frozen=True)
+class _Layout:
+    tick_len: int
+    cbar_width: int
+    cbar_gap: int
+    x_ticks: list[float]
+    y_ticks: list[float]
+    x_tick_labels: list[str]
+    y_tick_labels: list[str]
+    cbar_ticks: list[float]
+    cbar_tick_labels: list[str]
+    cbar_scale_text: str
+    max_cbar_label_width: int
+    cbar_scale_width: int
+    draw_rect: QtCore.QRect
+    y_tick_block: int
+    view_limits: _ViewLimits
+    view: _View
+    margins: tuple[int, int, int, int]
+
+
 class _ImageCanvas(QtWidgets.QWidget):
     """Custom widget that draws image plus axes, ticks, and labels."""
 
@@ -235,7 +298,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_mode_menu)
-        self._data: ndarray = asarray(data)
+        self._data: ndarray = _prepare_image_data(data)
         self._xaxis = xaxis
         self._yaxis = yaxis
         self._qimage, self._vmin, self._vmax = _array_to_qimage(
@@ -253,8 +316,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._markers: list[dict[str, object]] = []
         self._drag_target: dict[str, object] | None = None  # {"kind": "marker"/"box", "idx": int}
         self._box_drag_start = QtCore.QPoint()
-        self._mode_button: QtWidgets.QPushButton | None = None
-        self._current_layout: dict[str, object] | None = None
+        self._current_layout: _Layout | None = None
         self._tight_enabled = False
         self._tight_pad = 1.08
         self._tight_w_pad: float | None = None
@@ -266,6 +328,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._toast_label: QtWidgets.QLabel | None = None
         self._toast_opacity: QtWidgets.QGraphicsOpacityEffect | None = None
         self._toast_animation: QtCore.QAbstractAnimation | None = None
+        self._auto_resize_timer: QtCore.QTimer | None = None
         self._init_clipboard_shortcuts()
 
     def _update_content_ratio(self) -> None:
@@ -386,7 +449,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         """Copy only the data draw area to the clipboard as an image."""
         fm = QtGui.QFontMetrics(self.font())
         layout = self._current_layout or self._layout(fm)
-        draw_rect: QtCore.QRect = layout["draw_rect"]
+        draw_rect: QtCore.QRect = layout.draw_rect
         if draw_rect.isEmpty():
             return
         pixmap = self.grab(draw_rect)
@@ -496,14 +559,10 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._current_layout = None
         self.update()
 
-    def _layout(self, fm: QtGui.QFontMetrics):
+    def _layout(self, fm: QtGui.QFontMetrics) -> _Layout:
         """Compute layout rectangles and tick labels."""
-        tick_len = 6
-        cbar_width = 16
-        cbar_gap = 10
-
-        x_start, x_end, x_span = _axis_limits(self._xaxis, self._data.shape[1])
-        y_start, y_end, y_span = _axis_limits(self._yaxis, self._data.shape[0])
+        x_start, _, x_span = _axis_limits(self._xaxis, self._data.shape[1])
+        y_start, _, y_span = _axis_limits(self._yaxis, self._data.shape[0])
         cx, cy, width_frac, height_frac = self._view_window()
 
         x_view_min = x_start + (cx - width_frac / 2.0) * x_span
@@ -561,12 +620,12 @@ class _ImageCanvas(QtWidgets.QWidget):
             fm.boundingRect(self._colorbar_label).height() if self._colorbar_label else 0
         )
 
-        y_tick_block = tick_len + max_y_label_width
+        y_tick_block = _TICK_LEN + max_y_label_width
         margin_left = y_tick_block + pad_px
         if self._ylabel:
             margin_left += w_pad_px + max(ylabel_height, fm.height())
 
-        tick_block = tick_len + fm.height()
+        tick_block = _TICK_LEN + fm.height()
         margin_bottom = tick_block + max(pad_px // 2, 2)
         if self._xlabel:
             margin_bottom += h_pad_px + xlabel_height
@@ -591,18 +650,18 @@ class _ImageCanvas(QtWidgets.QWidget):
         cbar_scale_width = min(cbar_scale_width, 80)
         if self._colorbar:
             margin_right = (
-                cbar_gap
-                + cbar_width
-                + tick_len
+                _COLORBAR_GAP
+                + _COLORBAR_WIDTH
+                + _TICK_LEN
                 + max(max_cbar_label_width, cbar_scale_width)
                 + max(pad_px // 2, 2)
             )
             if self._colorbar_label:
                 margin_right = max(
                     margin_right,
-                    cbar_gap
-                    + cbar_width
-                    + tick_len
+                    _COLORBAR_GAP
+                    + _COLORBAR_WIDTH
+                    + _TICK_LEN
                     + max(max_cbar_label_width, cbar_scale_width)
                     + max(w_pad_px // 2, 2)
                     + max(cbar_label_height, fm.height()),
@@ -652,55 +711,55 @@ class _ImageCanvas(QtWidgets.QWidget):
             draw_y = margin_top + (avail_h - draw_h) // 2
         draw_rect = QtCore.QRect(draw_x, draw_y, draw_w, draw_h)
 
-        return {
-            "tick_len": tick_len,
-            "cbar_width": cbar_width,
-            "cbar_gap": cbar_gap,
-            "x_ticks": x_ticks,
-            "y_ticks": y_ticks,
-            "x_tick_labels": x_tick_labels,
-            "y_tick_labels": y_tick_labels,
-            "cbar_ticks": cbar_ticks,
-            "cbar_tick_labels": cbar_tick_labels,
-            "cbar_scale_text": cbar_scale_text,
-            "max_cbar_label_width": max_cbar_label_width,
-            "cbar_scale_width": cbar_scale_width,
-            "draw_rect": draw_rect,
-            "y_tick_block": y_tick_block,
-            "view_limits": {
-                "x_min": x_view_min,
-                "x_max": x_view_max,
-                "y_min": y_view_min,
-                "y_max": y_view_max,
-            },
-            "view": {
-                "cx": cx,
-                "cy": cy,
-                "width_frac": width_frac,
-                "height_frac": height_frac,
-            },
-            "margins": (margin_left, margin_right, margin_top, margin_bottom),
-        }
+        return _Layout(
+            tick_len=_TICK_LEN,
+            cbar_width=_COLORBAR_WIDTH,
+            cbar_gap=_COLORBAR_GAP,
+            x_ticks=x_ticks,
+            y_ticks=y_ticks,
+            x_tick_labels=x_tick_labels,
+            y_tick_labels=y_tick_labels,
+            cbar_ticks=cbar_ticks,
+            cbar_tick_labels=cbar_tick_labels,
+            cbar_scale_text=cbar_scale_text,
+            max_cbar_label_width=max_cbar_label_width,
+            cbar_scale_width=cbar_scale_width,
+            draw_rect=draw_rect,
+            y_tick_block=y_tick_block,
+            view_limits=_ViewLimits(
+                x_min=x_view_min,
+                x_max=x_view_max,
+                y_min=y_view_min,
+                y_max=y_view_max,
+            ),
+            view=_View(
+                cx=cx,
+                cy=cy,
+                width_frac=width_frac,
+                height_frac=height_frac,
+            ),
+            margins=(margin_left, margin_right, margin_top, margin_bottom),
+        )
 
     def _pixel_from_position(
-        self, pos: QtCore.QPoint, layout: dict[str, object]
+        self, pos: QtCore.QPoint, layout: _Layout
     ) -> tuple[int, int] | None:
         """Map a widget position to the nearest data pixel index."""
-        draw_rect: QtCore.QRect = layout["draw_rect"]
+        draw_rect: QtCore.QRect = layout.draw_rect
         if draw_rect.width() <= 0 or draw_rect.height() <= 0:
             return None
         if not draw_rect.contains(pos):
             return None
-        view_limits: dict[str, float] = layout["view_limits"]
-        x_range = view_limits["x_max"] - view_limits["x_min"]
-        y_range = view_limits["y_max"] - view_limits["y_min"]
+        view_limits = layout.view_limits
+        x_range = view_limits.x_max - view_limits.x_min
+        y_range = view_limits.y_max - view_limits.y_min
         if x_range == 0 or y_range == 0:
             return None
 
         rel_x = (pos.x() - draw_rect.left()) / draw_rect.width()
         rel_y = (pos.y() - draw_rect.top()) / draw_rect.height()
-        x_val = view_limits["x_min"] + rel_x * x_range
-        y_val = view_limits["y_min"] + rel_y * y_range
+        x_val = view_limits.x_min + rel_x * x_range
+        y_val = view_limits.y_min + rel_y * y_range
         col_idx = _nearest_index(x_val, self._xaxis, self._data.shape[1])
         row_idx = _nearest_index(y_val, self._yaxis, self._data.shape[0])
         return col_idx, row_idx
@@ -708,7 +767,7 @@ class _ImageCanvas(QtWidgets.QWidget):
     def _add_or_move_marker(
         self,
         pos: QtCore.QPoint,
-        layout: dict[str, object] | None = None,
+        layout: _Layout | None = None,
         existing_idx: int | None = None,
     ) -> int | None:
         """Place marker at nearest pixel or move existing one."""
@@ -732,7 +791,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         return existing_idx
 
     def _marker_position(
-        self, marker: dict[str, object], layout: dict[str, object]
+        self, marker: dict[str, object], layout: _Layout
     ) -> tuple[QtCore.QPointF, float, float, float] | None:
         """Return screen position plus data/axis values for a marker."""
         idx = marker.get("index")
@@ -746,29 +805,29 @@ class _ImageCanvas(QtWidgets.QWidget):
             marker["index"] = None
             return None
 
-        view_limits: dict[str, float] = layout["view_limits"]
-        x_range = view_limits["x_max"] - view_limits["x_min"]
-        y_range = view_limits["y_max"] - view_limits["y_min"]
+        view_limits = layout.view_limits
+        x_range = view_limits.x_max - view_limits.x_min
+        y_range = view_limits.y_max - view_limits.y_min
         if x_range == 0 or y_range == 0:
             return None
 
         x_val = _axis_value(self._xaxis, col_idx)
         y_val = _axis_value(self._yaxis, row_idx)
-        rel_x = (x_val - view_limits["x_min"]) / x_range
-        rel_y = (y_val - view_limits["y_min"]) / y_range
+        rel_x = (x_val - view_limits.x_min) / x_range
+        rel_y = (y_val - view_limits.y_min) / y_range
         if rel_x < 0.0 or rel_x > 1.0 or rel_y < 0.0 or rel_y > 1.0:
             return None
 
-        draw_rect: QtCore.QRect = layout["draw_rect"]
+        draw_rect: QtCore.QRect = layout.draw_rect
         px = draw_rect.left() + rel_x * draw_rect.width()
         py = draw_rect.top() + rel_y * draw_rect.height()
-        data_val = float(self._data[row_idx, col_idx])
+        data_val = float(np.abs(self._data[row_idx, col_idx]))
         return QtCore.QPointF(px, py), x_val, y_val, data_val
 
     def _marker_box_rect(
         self,
         marker: dict[str, object],
-        layout: dict[str, object],
+        layout: _Layout,
         fm: QtGui.QFontMetrics | None = None,
     ) -> tuple[QtCore.QRectF, QtCore.QPointF, list[str]] | None:
         """Compute bounding rect for marker tooltip box."""
@@ -829,7 +888,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         return box_rect, marker_pos, lines
 
     def _marker_hit(
-        self, pos: QtCore.QPoint, layout: dict[str, object]
+        self, pos: QtCore.QPoint, layout: _Layout
     ) -> tuple[int, dict[str, object]] | None:
         """Check if a click is close enough to any marker handle."""
         for idx, marker in enumerate(self._markers):
@@ -842,7 +901,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         return None
 
     def _marker_box_hit(
-        self, pos: QtCore.QPoint, layout: dict[str, object]
+        self, pos: QtCore.QPoint, layout: _Layout
     ) -> tuple[int, dict[str, object]] | None:
         """Check if a click lands on any marker tooltip box."""
         fm = QtGui.QFontMetrics(self.font())
@@ -862,31 +921,31 @@ class _ImageCanvas(QtWidgets.QWidget):
         fm = painter.fontMetrics()
         layout = self._layout(fm)
         self._current_layout = layout
-        draw_rect = layout["draw_rect"]
-        tick_len = layout["tick_len"]
-        cbar_width = layout["cbar_width"]
-        cbar_gap = layout["cbar_gap"]
-        x_ticks = layout["x_ticks"]
-        y_ticks = layout["y_ticks"]
-        x_tick_labels = layout["x_tick_labels"]
-        y_tick_labels = layout["y_tick_labels"]
-        cbar_ticks = layout["cbar_ticks"]
-        cbar_tick_labels = layout["cbar_tick_labels"]
-        cbar_scale_text = layout["cbar_scale_text"]
-        max_cbar_label_width = layout["max_cbar_label_width"]
-        cbar_scale_width = layout["cbar_scale_width"]
-        view_limits = layout["view_limits"]
-        view_state = layout["view"]
-        y_tick_block = layout["y_tick_block"]
-        margin_left, _, margin_top, margin_bottom = layout["margins"]
+        draw_rect = layout.draw_rect
+        tick_len = layout.tick_len
+        cbar_width = layout.cbar_width
+        cbar_gap = layout.cbar_gap
+        x_ticks = layout.x_ticks
+        y_ticks = layout.y_ticks
+        x_tick_labels = layout.x_tick_labels
+        y_tick_labels = layout.y_tick_labels
+        cbar_ticks = layout.cbar_ticks
+        cbar_tick_labels = layout.cbar_tick_labels
+        cbar_scale_text = layout.cbar_scale_text
+        max_cbar_label_width = layout.max_cbar_label_width
+        cbar_scale_width = layout.cbar_scale_width
+        view_limits = layout.view_limits
+        view_state = layout.view
+        y_tick_block = layout.y_tick_block
+        margin_left, _, margin_top, margin_bottom = layout.margins
 
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self._render_smooth)
         source_rect = QtCore.QRectF(
-            (view_state["cx"] - view_state["width_frac"] / 2.0) * self._qimage.width(),
-            (view_state["cy"] - view_state["height_frac"] / 2.0)
+            (view_state.cx - view_state.width_frac / 2.0) * self._qimage.width(),
+            (view_state.cy - view_state.height_frac / 2.0)
             * self._qimage.height(),
-            self._qimage.width() * view_state["width_frac"],
-            self._qimage.height() * view_state["height_frac"],
+            self._qimage.width() * view_state.width_frac,
+            self._qimage.height() * view_state.height_frac,
         )
         painter.drawImage(QtCore.QRectF(draw_rect), self._qimage, source_rect)
 
@@ -901,13 +960,13 @@ class _ImageCanvas(QtWidgets.QWidget):
         )  # x axis
 
         # X ticks
-        x_range = view_limits["x_max"] - view_limits["x_min"]
+        x_range = view_limits.x_max - view_limits.x_min
         for val, label in zip(x_ticks, x_tick_labels):
             pos = (
                 draw_rect.left()
                 if x_range == 0
                 else draw_rect.left()
-                + int((val - view_limits["x_min"]) / x_range * draw_rect.width())
+                + int((val - view_limits.x_min) / x_range * draw_rect.width())
             )
             painter.drawLine(
                 pos, draw_rect.bottom(), pos, draw_rect.bottom() + tick_len
@@ -923,13 +982,13 @@ class _ImageCanvas(QtWidgets.QWidget):
             )
 
         # Y ticks
-        y_range = view_limits["y_max"] - view_limits["y_min"]
+        y_range = view_limits.y_max - view_limits.y_min
         for val, label in zip(y_ticks, y_tick_labels):
             pos = (
                 draw_rect.top()
                 if y_range == 0
                 else draw_rect.top()
-                + int((val - view_limits["y_min"]) / y_range * draw_rect.height())
+                + int((val - view_limits.y_min) / y_range * draw_rect.height())
             )
             painter.drawLine(draw_rect.left() - tick_len, pos, draw_rect.left(), pos)
             text_rect = QtCore.QRectF(
@@ -1040,13 +1099,13 @@ class _ImageCanvas(QtWidgets.QWidget):
         # Title
         if self._title:
             painter.drawText(
-                QtCore.QRectF(0, 0, self.width(), layout["margins"][2]),
+                QtCore.QRectF(0, 0, self.width(), layout.margins[2]),
                 QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom,
                 self._title,
             )
         self._draw_marker(painter, layout)
         self._draw_rubber_band(painter)
-        self._auto_shrink_window(layout)
+        self._schedule_auto_shrink()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
         """Keep toast anchored near the corner on resize."""
@@ -1059,7 +1118,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         if delta == 0:
             return
         step = 1.1 if delta > 0 else 0.9
-        self._zoom_factor = float(clip(self._zoom_factor * step, 1.0, 10.0))
+        self._zoom_factor = float(clip(self._zoom_factor * step, 1.0, _MAX_ZOOM))
         self._current_layout = None
         self._view_window()  # clamp center after zoom changes
         self.update()
@@ -1138,7 +1197,7 @@ class _ImageCanvas(QtWidgets.QWidget):
             layout = self._current_layout or self._layout(
                 QtGui.QFontMetrics(self.font())
             )
-            draw_rect: QtCore.QRect = layout["draw_rect"]
+            draw_rect: QtCore.QRect = layout.draw_rect
             if draw_rect.width() > 0 and draw_rect.height() > 0:
                 width_frac = min(1.0, 1.0 / self._zoom_factor)
                 height_frac = min(1.0, 1.0 / self._zoom_factor)
@@ -1232,7 +1291,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         """Zoom into the selected rectangle."""
         fm = QtGui.QFontMetrics(self.font())
         layout = self._current_layout or self._layout(fm)
-        draw_rect: QtCore.QRect = layout["draw_rect"]
+        draw_rect: QtCore.QRect = layout.draw_rect
         intersect = selection & draw_rect
         if intersect.isEmpty():
             return
@@ -1244,17 +1303,19 @@ class _ImageCanvas(QtWidgets.QWidget):
 
         center_norm_x = (intersect.center().x() - draw_rect.left()) / draw_w
         center_norm_y = (intersect.center().y() - draw_rect.top()) / draw_h
-        view_state = layout["view"]
-        view_left = view_state["cx"] - view_state["width_frac"] / 2.0
-        view_top = view_state["cy"] - view_state["height_frac"] / 2.0
+        view_state = layout.view
+        view_left = view_state.cx - view_state.width_frac / 2.0
+        view_top = view_state.cy - view_state.height_frac / 2.0
         new_center = QtCore.QPointF(
-            view_left + center_norm_x * view_state["width_frac"],
-            view_top + center_norm_y * view_state["height_frac"],
+            view_left + center_norm_x * view_state.width_frac,
+            view_top + center_norm_y * view_state.height_frac,
         )
 
         factor_w = draw_w / sel_w
         factor_h = draw_h / sel_h
-        new_zoom = float(clip(self._zoom_factor * min(factor_w, factor_h), 1.0, 20.0))
+        new_zoom = float(
+            clip(self._zoom_factor * min(factor_w, factor_h), 1.0, _MAX_ZOOM)
+        )
 
         self._view_center = new_center
         self._zoom_factor = new_zoom
@@ -1271,7 +1332,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._drag_target = None
         self.update()
 
-    def _draw_marker(self, painter: QtGui.QPainter, layout: dict[str, object]) -> None:
+    def _draw_marker(self, painter: QtGui.QPainter, layout: _Layout) -> None:
         """Render MATLAB-style data markers and tooltips."""
         if not self._markers:
             return
@@ -1335,16 +1396,30 @@ class _ImageCanvas(QtWidgets.QWidget):
         painter.setBrush(QtGui.QBrush(fill_color))
         painter.drawRect(self._rubber_band)
 
-    def _auto_shrink_window(self, layout: dict[str, object]) -> None:
+    def _schedule_auto_shrink(self) -> None:
+        """Avoid resizing during paint; defer with a zero-timeout timer."""
+        if not (self._tight_enabled and self._tight_auto_resize_pending):
+            return
+        if self._auto_resize_timer is None:
+            self._auto_resize_timer = QtCore.QTimer(self)
+            self._auto_resize_timer.setSingleShot(True)
+            self._auto_resize_timer.timeout.connect(self._auto_shrink_window)
+        self._auto_resize_timer.start(0)
+
+    def _auto_shrink_window(self) -> None:
         """Optionally shrink the parent window to fit content more tightly."""
         if not (self._tight_enabled and self._tight_auto_resize_pending):
+            return
+        fm = QtGui.QFontMetrics(self.font())
+        layout = self._current_layout or self._layout(fm)
+        if layout is None:
             return
         win = self.window()
         if win is None:
             return
 
-        margins = layout["margins"]
-        draw_rect: QtCore.QRect = layout["draw_rect"]
+        margins = layout.margins
+        draw_rect: QtCore.QRect = layout.draw_rect
         avail_w = self.width() - margins[0] - margins[1]
         avail_h = self.height() - margins[2] - margins[3]
         extra_w = max(avail_w - draw_rect.width(), 0)
