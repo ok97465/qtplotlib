@@ -262,11 +262,135 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._tight_rect: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
         self._tight_auto_resize = False
         self._tight_auto_resize_pending = False
+        self._clipboard_shortcuts: list[QtGui.QShortcut] = []
+        self._toast_label: QtWidgets.QLabel | None = None
+        self._toast_opacity: QtWidgets.QGraphicsOpacityEffect | None = None
+        self._toast_animation: QtCore.QAbstractAnimation | None = None
+        self._init_clipboard_shortcuts()
 
     def _update_content_ratio(self) -> None:
         x_span = _axis_span(self._xaxis, self._data.shape[1], "xaxis")
         y_span = _axis_span(self._yaxis, self._data.shape[0], "yaxis")
         self._content_ratio = x_span / y_span if y_span != 0 else 1.0
+
+    def _init_clipboard_shortcuts(self) -> None:
+        """Register shortcuts for copying the window or data region to the clipboard."""
+        combos = [
+            ("Ctrl+C", self._copy_full_window_to_clipboard),
+            ("Meta+C", self._copy_full_window_to_clipboard),
+            ("Ctrl+Shift+C", self._copy_data_region_to_clipboard),
+            ("Meta+Shift+C", self._copy_data_region_to_clipboard),
+        ]
+        seen: set[str] = set()
+        for key_str, handler in combos:
+            sequence = QtGui.QKeySequence(key_str)
+            portable = sequence.toString(QtGui.QKeySequence.PortableText)
+            if portable in seen:
+                continue
+            seen.add(portable)
+            shortcut = QtGui.QShortcut(sequence, self)
+            shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(handler)
+            self._clipboard_shortcuts.append(shortcut)
+
+    def _ensure_toast(self) -> None:
+        """Create a floating toast label for copy feedback."""
+        if self._toast_label is not None and self._toast_opacity is not None:
+            return
+        label = QtWidgets.QLabel(self)
+        label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        label.setStyleSheet(
+            """
+            QLabel {
+                color: #0f1720;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                            stop:0 #f9d65c, stop:1 #f2a52f);
+                border-radius: 10px;
+                border: 1px solid rgba(0, 0, 0, 40);
+                padding: 7px 12px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+            }
+            """
+        )
+        label.hide()
+
+        opacity = QtWidgets.QGraphicsOpacityEffect(label)
+        opacity.setOpacity(0.0)
+        label.setGraphicsEffect(opacity)
+
+        self._toast_label = label
+        self._toast_opacity = opacity
+
+    def _position_toast(self) -> None:
+        """Place the toast near the top-right corner with a small margin."""
+        if self._toast_label is None:
+            return
+        margin = 12
+        self._toast_label.adjustSize()
+        x = max(margin, self.width() - self._toast_label.width() - margin)
+        y = margin
+        self._toast_label.move(x, y)
+
+    def _show_copy_notice(self, text: str) -> None:
+        """Animate a short-lived toast indicating a successful copy."""
+        self._ensure_toast()
+        if self._toast_label is None or self._toast_opacity is None:
+            return
+
+        if self._toast_animation is not None:
+            self._toast_animation.stop()
+            self._toast_animation.deleteLater()
+            self._toast_animation = None
+
+        self._toast_label.setText(text)
+        self._position_toast()
+        self._toast_label.show()
+        self._toast_opacity.setOpacity(0.0)
+
+        fade_in = QtCore.QPropertyAnimation(self._toast_opacity, b"opacity", self)
+        fade_in.setDuration(150)
+        fade_in.setStartValue(0.0)
+        fade_in.setEndValue(1.0)
+
+        pause = QtCore.QPauseAnimation(900, self)
+
+        fade_out = QtCore.QPropertyAnimation(self._toast_opacity, b"opacity", self)
+        fade_out.setDuration(260)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.0)
+
+        group = QtCore.QSequentialAnimationGroup(self)
+        group.addAnimation(fade_in)
+        group.addAnimation(pause)
+        group.addAnimation(fade_out)
+        group.finished.connect(self._toast_label.hide)
+        group.finished.connect(lambda: setattr(self, "_toast_animation", None))
+        self._toast_animation = group
+        group.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+
+    def _copy_pixmap_to_clipboard(self, pixmap: QtGui.QPixmap) -> None:
+        """Push a pixmap into the system clipboard if available."""
+        clipboard = QtWidgets.QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setPixmap(pixmap)
+            self._show_copy_notice("Copied")
+
+    def _copy_full_window_to_clipboard(self) -> None:
+        """Copy the entire window (minus OS frame) to the clipboard as an image."""
+        target = self.window() or self
+        pixmap = target.grab()
+        self._copy_pixmap_to_clipboard(pixmap)
+
+    def _copy_data_region_to_clipboard(self) -> None:
+        """Copy only the data draw area to the clipboard as an image."""
+        fm = QtGui.QFontMetrics(self.font())
+        layout = self._current_layout or self._layout(fm)
+        draw_rect: QtCore.QRect = layout["draw_rect"]
+        if draw_rect.isEmpty():
+            return
+        pixmap = self.grab(draw_rect)
+        self._copy_pixmap_to_clipboard(pixmap)
 
     def _view_window(self) -> tuple[float, float, float, float]:
         """Return normalized view center and size (fractions of full image)."""
@@ -924,6 +1048,11 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._draw_rubber_band(painter)
         self._auto_shrink_window(layout)
 
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
+        """Keep toast anchored near the corner on resize."""
+        super().resizeEvent(event)
+        self._position_toast()
+
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # type: ignore[override]
         """Zoom in/out with mouse wheel."""
         delta = event.angleDelta().y()
@@ -1066,6 +1195,9 @@ class _ImageCanvas(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         pan_action = menu.addAction("Pan mode")
         box_action = menu.addAction("Box-zoom mode")
+        menu.addSeparator()
+        copy_window_action = menu.addAction("Copy window to clipboard")
+        copy_data_action = menu.addAction("Copy data area to clipboard")
         delete_action = None
         hit_marker = self._marker_hit(pos, layout)
         hit_box = self._marker_box_hit(pos, layout)
@@ -1089,6 +1221,10 @@ class _ImageCanvas(QtWidgets.QWidget):
             self._drag_mode = "pan"
         elif chosen == box_action:
             self._drag_mode = "box"
+        elif chosen == copy_window_action:
+            self._copy_full_window_to_clipboard()
+        elif chosen == copy_data_action:
+            self._copy_data_region_to_clipboard()
         elif delete_action is not None and chosen == delete_action and target_idx is not None:
             self._clear_marker(target_idx)
 
