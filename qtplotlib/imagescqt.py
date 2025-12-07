@@ -396,7 +396,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._toast_label.move(x, y)
 
     def _show_copy_notice(self, text: str) -> None:
-        """Animate a short-lived toast indicating a successful copy."""
+        """Animate a short-lived toast indicating a successful action."""
         self._ensure_toast()
         if self._toast_label is None or self._toast_opacity is None:
             return
@@ -444,6 +444,41 @@ class _ImageCanvas(QtWidgets.QWidget):
         target = self.window() or self
         pixmap = target.grab()
         self._copy_pixmap_to_clipboard(pixmap)
+
+    def _save_full_window_to_png(self) -> None:
+        """Open a dialog and save the current window snapshot as a PNG."""
+        target = self.window() or self
+        pixmap = target.grab()
+        if pixmap.isNull():
+            return
+
+        base_name = target.windowTitle() or "imagescqt"
+        default_path = f"{base_name}.png"
+
+        # Use a persistent dialog (non-native avoids disappearing on some platforms).
+        dialog = QtWidgets.QFileDialog(target, "Save window as PNG")
+        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
+        dialog.setNameFilter("PNG Images (*.png)")
+        dialog.selectFile(default_path)
+        dialog.setDefaultSuffix("png")
+        dialog.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)
+
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        filename_list = dialog.selectedFiles()
+        if not filename_list:
+            return
+        filename = filename_list[0]
+        if not filename.lower().endswith(".png"):
+            filename += ".png"
+        if not pixmap.save(filename, "PNG"):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Save failed",
+                "Could not save the current window as a PNG file.",
+            )
+            return
+        self._show_copy_notice("Saved PNG")
 
     def _copy_data_region_to_clipboard(self) -> None:
         """Copy only the data draw area to the clipboard as an image."""
@@ -1257,6 +1292,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         menu.addSeparator()
         copy_window_action = menu.addAction("Copy window to clipboard")
         copy_data_action = menu.addAction("Copy data area to clipboard")
+        save_png_action = menu.addAction("Save window as PNG...")
         delete_action = None
         hit_marker = self._marker_hit(pos, layout)
         hit_box = self._marker_box_hit(pos, layout)
@@ -1284,6 +1320,8 @@ class _ImageCanvas(QtWidgets.QWidget):
             self._copy_full_window_to_clipboard()
         elif chosen == copy_data_action:
             self._copy_data_region_to_clipboard()
+        elif chosen == save_png_action:
+            self._save_full_window_to_png()
         elif delete_action is not None and chosen == delete_action and target_idx is not None:
             self._clear_marker(target_idx)
 
