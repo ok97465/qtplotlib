@@ -22,9 +22,9 @@ imagescqt(data)  # opens a Qt window (interpolation='nearest', cmap='viridis')
 x = np.linspace(-5, 5, data.shape[1])
 y = np.linspace(-2, 2, data.shape[0])
 win = imagescqt(
+    x,
+    y,
     data,
-    xaxis=x,
-    yaxis=y,
     aspect="equal",           # 'equal' keeps data aspect, 'auto' fills space
     xlabel="X label",
     ylabel="Y label",

@@ -199,6 +199,30 @@ def _format_tick(val: float) -> str:
     return f"{val:.4g}"
 
 
+def _parse_axes_and_data(
+    args: tuple[object, ...],
+    xaxis_kw: ndarray | None,
+    yaxis_kw: ndarray | None,
+    func_name: str = "imagescqt",
+) -> tuple[object, ndarray | None, ndarray | None]:
+    """Support MATLAB-style signatures: (data) or (x, y, data)."""
+    if len(args) == 1:
+        return args[0], xaxis_kw, yaxis_kw
+    if len(args) == 3:
+        if xaxis_kw is not None or yaxis_kw is not None:
+            raise TypeError(
+                f"{func_name} accepts axes either positionally (x, y, data) "
+                "or via xaxis/yaxis keywords, not both."
+            )
+        xaxis_arg, yaxis_arg, data_arg = args
+        return data_arg, xaxis_arg, yaxis_arg
+    if len(args) == 0:
+        raise TypeError(f"{func_name} requires at least a data array.")
+    raise TypeError(
+        f"{func_name} supports {func_name}(data) or {func_name}(x, y, data)."
+    )
+
+
 def _scaled_tick_labels(values: list[float]) -> tuple[list[str], str]:
     """Return labels and optional scale text using scientific notation if needed."""
     finite = [abs(v) for v in values if isfinite(v) and v != 0]
@@ -1520,17 +1544,19 @@ class ImageWindow(QtWidgets.QMainWindow):
 
     def set_image(
         self,
-        data: ndarray,
-        *,
+        *args: object,
         cmap: str = "viridis",
         vmin: float | None = None,
         vmax: float | None = None,
         xaxis: ndarray | None = None,
         yaxis: ndarray | None = None,
     ) -> None:
-        """Update the displayed image and optional axes."""
+        """Update the displayed image and optional axes (data or x, y, data)."""
+        data_arg, xaxis_arg, yaxis_arg = _parse_axes_and_data(
+            args, xaxis, yaxis, "set_image"
+        )
         self._canvas.set_image(
-            data, cmap=cmap, vmin=vmin, vmax=vmax, xaxis=xaxis, yaxis=yaxis
+            data_arg, cmap=cmap, vmin=vmin, vmax=vmax, xaxis=xaxis_arg, yaxis=yaxis_arg
         )
 
     def set_xlabel(self, text: str) -> None:
@@ -1580,20 +1606,19 @@ class ImageWindow(QtWidgets.QMainWindow):
 
 
 def imagescqt(
-    data: ndarray,
-    *,
+    *args: object,
     cmap: str = "viridis",
     vmin: float | None = None,
     vmax: float | None = None,
     title: str = "imagescqt",
     interpolation: str = "nearest",
-    xaxis: ndarray | None = None,
-    yaxis: ndarray | None = None,
     aspect: str = "equal",
     xlabel: str = "",
     ylabel: str = "",
     colorbar: bool = False,
     colorbar_label: str = "",
+    xaxis: ndarray | None = None,
+    yaxis: ndarray | None = None,
 ) -> ImageWindow:
     """
     Display a numpy array in a PySide6 window (MATLAB imagesc style).
@@ -1603,7 +1628,10 @@ def imagescqt(
     running, a new one is created and the call will block until the window
     closes.
     """
-    arr = asarray(data)
+    data_arg, xaxis_arg, yaxis_arg = _parse_axes_and_data(
+        args, xaxis, yaxis, "imagescqt"
+    )
+    arr = asarray(data_arg)
     if arr.ndim != 2:
         raise ValueError(f"imagescqt expects a 2D array, got shape {arr.shape}")
 
@@ -1620,8 +1648,8 @@ def imagescqt(
         vmax=vmax,
         title=title,
         interpolation=interpolation,
-        xaxis=xaxis,
-        yaxis=yaxis,
+        xaxis=xaxis_arg,
+        yaxis=yaxis_arg,
         aspect=aspect,
         xlabel=xlabel,
         ylabel=ylabel,
