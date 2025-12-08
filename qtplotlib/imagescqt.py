@@ -525,6 +525,17 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._view_center = QtCore.QPointF(cx, cy)
         return cx, cy, width_frac, height_frac
 
+    def _reset_zoom(self) -> None:
+        """Return to the default full-view zoom and clear transient drag state."""
+        self._zoom_factor = 1.0
+        self._view_center = QtCore.QPointF(0.5, 0.5)
+        self._rubber_band = None
+        self._dragging = False
+        self._drag_target = None
+        self._current_layout = None
+        self._view_window()
+        self.update()
+
     def set_image(
         self,
         data: ndarray,
@@ -1181,6 +1192,14 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._current_layout = None
         self._view_window()  # clamp center after zoom changes
         self.update()
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        """Reset zoom when the user double-clicks with the left mouse button."""
+        if event.button() == QtCore.Qt.LeftButton:
+            self._reset_zoom()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
         if event.button() != QtCore.Qt.LeftButton:
