@@ -331,13 +331,16 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._update_content_ratio()
         self._reset_zoom_state()
         self._drag_mode: str = "pan"  # pan or box
+        self._zoom_axis_mode: str = "off"  # off, xy, x, y
         self._dragging = False
         self._drag_start = QtCore.QPoint()
         self._view_center_start = QtCore.QPointF(0.5, 0.5)
         self._rubber_band: QtCore.QRect | None = None
+        self._rubber_band_kind: str | None = None  # box or zoom-{axis}
         self._markers: list[dict[str, object]] = []
         self._drag_target: dict[str, object] | None = None  # {"kind": "marker"/"box", "idx": int}
         self._box_drag_start = QtCore.QPoint()
+        self._zoom_alt: bool = False
         self._current_layout: _Layout | None = None
         self._tight_enabled = False
         self._tight_pad = 1.08
@@ -363,6 +366,28 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._zoom_x = 1.0
         self._zoom_y = 1.0
         self._view_center = QtCore.QPointF(0.5, 0.5)
+
+    def _update_zoom_cursor(self) -> None:
+        """Reflect the current zoom axis mode in the mouse cursor."""
+        if self._zoom_axis_mode == "xy":
+            self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.CrossCursor))
+        elif self._zoom_axis_mode == "x":
+            self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.SizeHorCursor))
+        elif self._zoom_axis_mode == "y":
+            self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.SizeVerCursor))
+        else:
+            self.unsetCursor()
+
+    def _set_zoom_mode(self, mode: str) -> None:
+        """Switch zoom axis mode; accepted values: off, xy, x, y."""
+        if mode not in {"off", "xy", "x", "y"}:
+            mode = "off"
+        self._zoom_axis_mode = mode
+        self._dragging = False
+        self._rubber_band = None
+        self._rubber_band_kind = None
+        self._zoom_alt = False
+        self._update_zoom_cursor()
 
     def _init_clipboard_shortcuts(self) -> None:
         """Register shortcuts for copying the window or data region to the clipboard."""
@@ -540,6 +565,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         """Return to the default full-view zoom and clear transient drag state."""
         self._reset_zoom_state()
         self._rubber_band = None
+        self._rubber_band_kind = None
         self._dragging = False
         self._drag_target = None
         self._current_layout = None
@@ -1197,7 +1223,12 @@ class _ImageCanvas(QtWidgets.QWidget):
         if delta == 0:
             return
         step = 1.1 if delta > 0 else 0.9
-        self._apply_uniform_zoom(step)
+        if self._zoom_axis_mode == "x":
+            self._zoom_x = max(float(self._zoom_x * step), 1.0)
+        elif self._zoom_axis_mode == "y":
+            self._zoom_y = max(float(self._zoom_y * step), 1.0)
+        else:
+            self._apply_uniform_zoom(step)
         self._current_layout = None
         self._view_window()  # clamp center after zoom changes
         self.update()
@@ -1248,6 +1279,17 @@ class _ImageCanvas(QtWidgets.QWidget):
             event.accept()
             return
 
+        if self._zoom_axis_mode != "off":
+            self._drag_target = None
+            self._dragging = True
+            self._drag_start = event.pos()
+            self._view_center_start = QtCore.QPointF(self._view_center)
+            self._rubber_band = None
+            self._rubber_band_kind = None
+            self._zoom_alt = bool(event.modifiers() & QtCore.Qt.AltModifier)
+            event.accept()
+            return
+
         self._drag_target = None
         self._dragging = True
         self._drag_start = event.pos()
@@ -1279,6 +1321,19 @@ class _ImageCanvas(QtWidgets.QWidget):
                     return
         if not self._dragging:
             return
+        if self._zoom_axis_mode != "off":
+            fm = QtGui.QFontMetrics(self.font())
+            layout = self._current_layout or self._layout(fm)
+            zoom_rect = self._zoom_selection_rect(
+                layout.draw_rect, self._drag_start, event.pos(), self._zoom_axis_mode
+            )
+            self._rubber_band = zoom_rect
+            self._rubber_band_kind = (
+                f"zoom-{self._zoom_axis_mode}" if zoom_rect is not None else None
+            )
+            self.update()
+            event.accept()
+            return
         if self._drag_mode == "pan":
             delta = event.pos() - self._drag_start
             layout = self._current_layout or self._layout(
@@ -1301,6 +1356,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         else:  # box
             rect = QtCore.QRect(self._drag_start, event.pos()).normalized()
             self._rubber_band = rect
+            self._rubber_band_kind = "box"
             self.update()
         event.accept()
 
@@ -1313,10 +1369,42 @@ class _ImageCanvas(QtWidgets.QWidget):
             return
         if not self._dragging:
             return
+        if self._zoom_axis_mode != "off":
+            self._dragging = False
+            applied = False
+            move_x = abs(event.pos().x() - self._drag_start.x())
+            move_y = abs(event.pos().y() - self._drag_start.y())
+            threshold = 3
+            if self._zoom_axis_mode == "x":
+                has_band = move_x > threshold
+            elif self._zoom_axis_mode == "y":
+                has_band = move_y > threshold
+            else:
+                has_band = move_x > threshold or move_y > threshold
+            if has_band and self._rubber_band is not None:
+                applied = self._apply_zoom_selection(
+                    self._rubber_band,
+                    self._zoom_axis_mode,
+                    zoom_out=self._zoom_alt,
+                )
+            else:
+                applied = self._apply_click_zoom(
+                    self._drag_start,
+                    self._zoom_axis_mode,
+                    zoom_out=self._zoom_alt,
+                )
+            self._rubber_band = None
+            self._rubber_band_kind = None
+            self._current_layout = None
+            self._zoom_alt = False
+            if applied:
+                event.accept()
+                return
         self._dragging = False
         if self._drag_mode == "box" and self._rubber_band is not None:
             self._apply_box_zoom(self._rubber_band)
             self._rubber_band = None
+            self._rubber_band_kind = None
         self._current_layout = None
         self.update()
         event.accept()
@@ -1326,6 +1414,7 @@ class _ImageCanvas(QtWidgets.QWidget):
             event.modifiers() & QtCore.Qt.ShiftModifier
         ):
             self._drag_mode = "box" if self._drag_mode == "pan" else "pan"
+            self._set_zoom_mode("off")
             event.accept()
             return
         if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
@@ -1340,8 +1429,16 @@ class _ImageCanvas(QtWidgets.QWidget):
         fm = QtGui.QFontMetrics(self.font())
         layout = self._current_layout or self._layout(fm)
         menu = QtWidgets.QMenu(self)
+        zoom_action = menu.addAction("확대/축소")
+        zoom_x_action = menu.addAction("가로 확대/축소")
+        zoom_y_action = menu.addAction("세로 확대/축소")
         pan_action = menu.addAction("Pan mode")
         box_action = menu.addAction("Box-zoom mode")
+        mode_group = QtGui.QActionGroup(menu)
+        for act in (zoom_action, zoom_x_action, zoom_y_action, pan_action, box_action):
+            act.setCheckable(True)
+            mode_group.addAction(act)
+        mode_group.setExclusive(True)
         menu.addSeparator()
         copy_window_action = menu.addAction("Copy window to clipboard")
         copy_data_action = menu.addAction("Copy data area to clipboard")
@@ -1356,18 +1453,30 @@ class _ImageCanvas(QtWidgets.QWidget):
             target_idx = hit_box[0]
         if target_idx is not None:
             delete_action = menu.addAction("Delete marker")
-        current_mode = self._drag_mode
-        pan_action.setCheckable(True)
-        box_action.setCheckable(True)
-        if current_mode == "pan":
+        current_zoom = self._zoom_axis_mode
+        if current_zoom == "xy":
+            zoom_action.setChecked(True)
+        elif current_zoom == "x":
+            zoom_x_action.setChecked(True)
+        elif current_zoom == "y":
+            zoom_y_action.setChecked(True)
+        elif self._drag_mode == "pan":
             pan_action.setChecked(True)
         else:
             box_action.setChecked(True)
 
         chosen = menu.exec(self.mapToGlobal(pos))
-        if chosen == pan_action:
+        if chosen == zoom_action:
+            self._set_zoom_mode("xy")
+        elif chosen == zoom_x_action:
+            self._set_zoom_mode("x")
+        elif chosen == zoom_y_action:
+            self._set_zoom_mode("y")
+        elif chosen == pan_action:
+            self._set_zoom_mode("off")
             self._drag_mode = "pan"
         elif chosen == box_action:
+            self._set_zoom_mode("off")
             self._drag_mode = "box"
         elif chosen == copy_window_action:
             self._copy_full_window_to_clipboard()
@@ -1377,6 +1486,145 @@ class _ImageCanvas(QtWidgets.QWidget):
             self._save_full_window_to_png()
         elif delete_action is not None and chosen == delete_action and target_idx is not None:
             self._clear_marker(target_idx)
+
+    def _zoom_selection_rect(
+        self,
+        draw_rect: QtCore.QRect,
+        start: QtCore.QPoint,
+        current: QtCore.QPoint,
+        axis_mode: str,
+    ) -> QtCore.QRect | None:
+        """Clamp and shape the rubber-band rectangle for zoom drag."""
+        if draw_rect.isEmpty():
+            return None
+        start_x = max(min(start.x(), draw_rect.right()), draw_rect.left())
+        start_y = max(min(start.y(), draw_rect.bottom()), draw_rect.top())
+        cur_x = max(min(current.x(), draw_rect.right()), draw_rect.left())
+        cur_y = max(min(current.y(), draw_rect.bottom()), draw_rect.top())
+
+        if axis_mode == "x":
+            left = min(start_x, cur_x)
+            right = max(start_x, cur_x)
+            return QtCore.QRect(
+                QtCore.QPoint(left, draw_rect.top()),
+                QtCore.QPoint(right, draw_rect.bottom()),
+            ).normalized()
+        if axis_mode == "y":
+            top = min(start_y, cur_y)
+            bottom = max(start_y, cur_y)
+            return QtCore.QRect(
+                QtCore.QPoint(draw_rect.left(), top),
+                QtCore.QPoint(draw_rect.right(), bottom),
+            ).normalized()
+
+        rect = QtCore.QRect(
+            QtCore.QPoint(start_x, start_y), QtCore.QPoint(cur_x, cur_y)
+        ).normalized()
+        rect = rect & draw_rect
+        if rect.isEmpty():
+            return None
+        return rect
+
+    def _apply_click_zoom(
+        self,
+        pos: QtCore.QPoint,
+        axis_mode: str,
+        *,
+        zoom_out: bool = False,
+    ) -> bool:
+        """Zoom toward the clicked position along the requested axis mode."""
+        fm = QtGui.QFontMetrics(self.font())
+        layout = self._current_layout or self._layout(fm)
+        draw_rect: QtCore.QRect = layout.draw_rect
+        if draw_rect.isEmpty() or not draw_rect.contains(pos):
+            return False
+
+        view_state = layout.view
+        draw_w = max(draw_rect.width(), 1)
+        draw_h = max(draw_rect.height(), 1)
+        rel_x = (pos.x() - draw_rect.left()) / draw_w
+        rel_y = (pos.y() - draw_rect.top()) / draw_h
+        view_left = view_state.cx - view_state.width_frac / 2.0
+        view_top = view_state.cy - view_state.height_frac / 2.0
+        self._view_center = QtCore.QPointF(
+            view_left + rel_x * view_state.width_frac,
+            view_top + rel_y * view_state.height_frac,
+        )
+
+        factor = 1.1
+        if zoom_out:
+            factor = 1.0 / factor
+        if axis_mode in {"xy", "x"}:
+            self._zoom_x = max(float(self._zoom_x * factor), 1.0)
+        if axis_mode in {"xy", "y"}:
+            self._zoom_y = max(float(self._zoom_y * factor), 1.0)
+
+        self._view_window()
+        self._current_layout = None
+        self.update()
+        return True
+
+    def _apply_zoom_selection(
+        self,
+        selection: QtCore.QRect,
+        axis_mode: str,
+        *,
+        zoom_out: bool = False,
+    ) -> bool:
+        """Apply drag-based zoom according to the current zoom axis mode."""
+        fm = QtGui.QFontMetrics(self.font())
+        layout = self._current_layout or self._layout(fm)
+        draw_rect: QtCore.QRect = layout.draw_rect
+        intersect = selection & draw_rect
+        if intersect.isEmpty():
+            return False
+
+        sel_w = max(intersect.width(), 1)
+        sel_h = max(intersect.height(), 1)
+        draw_w = max(draw_rect.width(), 1)
+        draw_h = max(draw_rect.height(), 1)
+
+        view_state = layout.view
+        center_norm_x = (intersect.center().x() - draw_rect.left()) / draw_w
+        center_norm_y = (intersect.center().y() - draw_rect.top()) / draw_h
+        view_left = view_state.cx - view_state.width_frac / 2.0
+        view_top = view_state.cy - view_state.height_frac / 2.0
+        new_center = QtCore.QPointF(
+            view_left + center_norm_x * view_state.width_frac,
+            view_top + center_norm_y * view_state.height_frac,
+        )
+
+        factor_w = draw_w / sel_w
+        factor_h = draw_h / sel_h
+        if zoom_out:
+            factor_w = 1.0 / factor_w
+            factor_h = 1.0 / factor_h
+
+        cx = self._view_center.x()
+        cy = self._view_center.y()
+        if axis_mode in {"xy", "x"}:
+            cx = new_center.x()
+        if axis_mode in {"xy", "y"}:
+            cy = new_center.y()
+        self._view_center = QtCore.QPointF(cx, cy)
+
+        if axis_mode == "xy":
+            if self._aspect_mode == "equal":
+                self._apply_uniform_zoom(min(factor_w, factor_h))
+            else:
+                self._zoom_x = max(float(self._zoom_x * factor_w), 1.0)
+                self._zoom_y = max(float(self._zoom_y * factor_h), 1.0)
+        elif axis_mode == "x":
+            self._zoom_x = max(float(self._zoom_x * factor_w), 1.0)
+        elif axis_mode == "y":
+            self._zoom_y = max(float(self._zoom_y * factor_h), 1.0)
+        else:
+            return False
+
+        self._view_window()
+        self._current_layout = None
+        self.update()
+        return True
 
     def _apply_box_zoom(self, selection: QtCore.QRect) -> None:
         """Zoom into the selected rectangle."""
@@ -1479,7 +1727,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         painter.restore()
 
     def _draw_rubber_band(self, painter: QtGui.QPainter) -> None:
-        if self._drag_mode != "box" or self._rubber_band is None:
+        if self._rubber_band is None:
             return
         pen_color, fill_color = _rubber_band_colors(self._cmap)
         pen = QtGui.QPen(pen_color)
