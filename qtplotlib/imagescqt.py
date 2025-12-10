@@ -12,7 +12,6 @@ _COLORMAP_CACHE: dict[str, object] = {}
 _TICK_LEN = 6
 _COLORBAR_WIDTH = 16
 _COLORBAR_GAP = 10
-_MAX_ZOOM = 10.0
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -330,8 +329,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         )
         self._colorbar_image: QtGui.QImage = _make_colorbar_image(self._cmap)
         self._update_content_ratio()
-        self._zoom_factor = 1.0
-        self._view_center = QtCore.QPointF(0.5, 0.5)
+        self._reset_zoom_state()
         self._drag_mode: str = "pan"  # pan or box
         self._dragging = False
         self._drag_start = QtCore.QPoint()
@@ -359,6 +357,12 @@ class _ImageCanvas(QtWidgets.QWidget):
         x_span = _axis_span(self._xaxis, self._data.shape[1], "xaxis")
         y_span = _axis_span(self._yaxis, self._data.shape[0], "yaxis")
         self._content_ratio = x_span / y_span if y_span != 0 else 1.0
+
+    def _reset_zoom_state(self) -> None:
+        """Return zoom and center to the full-view defaults."""
+        self._zoom_x = 1.0
+        self._zoom_y = 1.0
+        self._view_center = QtCore.QPointF(0.5, 0.5)
 
     def _init_clipboard_shortcuts(self) -> None:
         """Register shortcuts for copying the window or data region to the clipboard."""
@@ -516,8 +520,8 @@ class _ImageCanvas(QtWidgets.QWidget):
 
     def _view_window(self) -> tuple[float, float, float, float]:
         """Return normalized view center and size (fractions of full image)."""
-        width_frac = min(1.0, 1.0 / self._zoom_factor)
-        height_frac = min(1.0, 1.0 / self._zoom_factor)
+        width_frac = min(1.0, 1.0 / max(self._zoom_x, 1e-9))
+        height_frac = min(1.0, 1.0 / max(self._zoom_y, 1e-9))
         half_w = width_frac / 2.0
         half_h = height_frac / 2.0
         cx = float(clip(self._view_center.x(), half_w, 1.0 - half_w))
@@ -525,10 +529,16 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._view_center = QtCore.QPointF(cx, cy)
         return cx, cy, width_frac, height_frac
 
+    def _apply_uniform_zoom(self, factor: float) -> None:
+        """Scale zoom identically on both axes while keeping it non-negative."""
+        if factor <= 0:
+            return
+        self._zoom_x = max(float(self._zoom_x * factor), 1.0)
+        self._zoom_y = max(float(self._zoom_y * factor), 1.0)
+
     def _reset_zoom(self) -> None:
         """Return to the default full-view zoom and clear transient drag state."""
-        self._zoom_factor = 1.0
-        self._view_center = QtCore.QPointF(0.5, 0.5)
+        self._reset_zoom_state()
         self._rubber_band = None
         self._dragging = False
         self._drag_target = None
@@ -559,8 +569,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         )
         self._colorbar_image = _make_colorbar_image(self._cmap)
         self._update_content_ratio()
-        self._zoom_factor = 1.0
-        self._view_center = QtCore.QPointF(0.5, 0.5)
+        self._reset_zoom_state()
         self._markers = []
         self._drag_target = None
         self._current_layout = None
@@ -1188,7 +1197,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         if delta == 0:
             return
         step = 1.1 if delta > 0 else 0.9
-        self._zoom_factor = float(clip(self._zoom_factor * step, 1.0, _MAX_ZOOM))
+        self._apply_uniform_zoom(step)
         self._current_layout = None
         self._view_window()  # clamp center after zoom changes
         self.update()
@@ -1277,8 +1286,9 @@ class _ImageCanvas(QtWidgets.QWidget):
             )
             draw_rect: QtCore.QRect = layout.draw_rect
             if draw_rect.width() > 0 and draw_rect.height() > 0:
-                width_frac = min(1.0, 1.0 / self._zoom_factor)
-                height_frac = min(1.0, 1.0 / self._zoom_factor)
+                view_state = layout.view
+                width_frac = view_state.width_frac
+                height_frac = view_state.height_frac
                 dx = delta.x() / draw_rect.width() * width_frac
                 dy = delta.y() / draw_rect.height() * height_frac
                 self._view_center = QtCore.QPointF(
@@ -1394,12 +1404,14 @@ class _ImageCanvas(QtWidgets.QWidget):
 
         factor_w = draw_w / sel_w
         factor_h = draw_h / sel_h
-        new_zoom = float(
-            clip(self._zoom_factor * min(factor_w, factor_h), 1.0, _MAX_ZOOM)
-        )
 
         self._view_center = new_center
-        self._zoom_factor = new_zoom
+        if self._aspect_mode == "equal":
+            self._apply_uniform_zoom(min(factor_w, factor_h))
+        else:
+            # Stretch zoom per-axis so the rubber-band region fills the draw area.
+            self._zoom_x = max(float(self._zoom_x * factor_w), 1.0)
+            self._zoom_y = max(float(self._zoom_y * factor_h), 1.0)
         self._view_window()
         self._current_layout = None
 
