@@ -12,6 +12,18 @@ _COLORMAP_CACHE: dict[str, object] = {}
 _TICK_LEN = 6
 _COLORBAR_WIDTH = 16
 _COLORBAR_GAP = 10
+_MARKER_OUTER_WIDTH = 4
+_MARKER_INNER_WIDTH = 2
+_MARKER_RADIUS_OUTER = 6
+_MARKER_RADIUS_INNER = 5
+_MARKER_CROSS_HALF = 10
+_MARKER_HIT_RADIUS = 8.0
+_MARKER_BOX_OFFSET = 12
+_MARKER_TOOLTIP_H_PADDING = 7
+_MARKER_TOOLTIP_V_PADDING = 5
+_MARKER_TOOLTIP_CLAMP_MARGIN = 4.0
+_MARKER_ANCHOR_OFFSET = 8
+_MARKER_TOOLTIP_CORNER_RADIUS = 6
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -287,6 +299,14 @@ class _Layout:
     margins: tuple[int, int, int, int]
 
 
+@dataclass
+class _Marker:
+    """Simple carrier for marker position and tooltip offset."""
+
+    index: tuple[int, int] | None
+    box_offset: QtCore.QPointF | None = None
+
+
 class _ImageCanvas(QtWidgets.QWidget):
     """Custom widget that draws image plus axes, ticks, and labels."""
 
@@ -337,7 +357,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._view_center_start = QtCore.QPointF(0.5, 0.5)
         self._rubber_band: QtCore.QRect | None = None
         self._rubber_band_kind: str | None = None  # box or zoom-{axis}
-        self._markers: list[dict[str, object]] = []
+        self._markers: list[_Marker] = []
         self._drag_target: dict[str, object] | None = None  # {"kind": "marker"/"box", "idx": int}
         self._box_drag_start = QtCore.QPoint()
         self._zoom_alt: bool = False
@@ -583,16 +603,17 @@ class _ImageCanvas(QtWidgets.QWidget):
         yaxis: ndarray | None = None,
     ) -> None:
         """Update image data and axes."""
-        arr = asarray(data)
-        if arr.ndim != 2:
-            raise ValueError(f"imagescqt expects a 2D array, got shape {arr.shape}")
-        self._data = arr
+        prepared = _prepare_image_data(data)
+        qimage, vmin_resolved, vmax_resolved = _array_to_qimage(
+            prepared, cmap=cmap, vmin=vmin, vmax=vmax
+        )
+        self._data = prepared
         self._xaxis = xaxis
         self._yaxis = yaxis
         self._cmap = cmap
-        self._qimage, self._vmin, self._vmax = _array_to_qimage(
-            arr, cmap=cmap, vmin=vmin, vmax=vmax
-        )
+        self._qimage = qimage
+        self._vmin = vmin_resolved
+        self._vmax = vmax_resolved
         self._colorbar_image = _make_colorbar_image(self._cmap)
         self._update_content_ratio()
         self._reset_zoom_state()
@@ -882,24 +903,22 @@ class _ImageCanvas(QtWidgets.QWidget):
         if pixel is None:
             return None
         if existing_idx is None:
-            marker = {
-                "index": pixel,
-                "box_offset": None,
-            }
-            self._markers.append(marker)
+            self._markers.append(_Marker(index=pixel))
             self._rubber_band = None
             self.update()
             return len(self._markers) - 1
-        self._markers[existing_idx]["index"] = pixel
+        if not (0 <= existing_idx < len(self._markers)):
+            return None
+        self._markers[existing_idx].index = pixel
         self._rubber_band = None
         self.update()
         return existing_idx
 
     def _marker_position(
-        self, marker: dict[str, object], layout: _Layout
+        self, marker: _Marker, layout: _Layout
     ) -> tuple[QtCore.QPointF, float, float, float] | None:
         """Return screen position plus data/axis values for a marker."""
-        idx = marker.get("index")
+        idx = marker.index
         if idx is None:
             return None
         col_idx, row_idx = idx
@@ -907,7 +926,7 @@ class _ImageCanvas(QtWidgets.QWidget):
             0 <= row_idx < self._data.shape[0]
             and 0 <= col_idx < self._data.shape[1]
         ):
-            marker["index"] = None
+            marker.index = None
             return None
 
         view_limits = layout.view_limits
@@ -931,7 +950,7 @@ class _ImageCanvas(QtWidgets.QWidget):
 
     def _marker_box_rect(
         self,
-        marker: dict[str, object],
+        marker: _Marker,
         layout: _Layout,
         fm: QtGui.QFontMetrics | None = None,
     ) -> tuple[QtCore.QRectF, QtCore.QPointF, list[str]] | None:
@@ -947,67 +966,66 @@ class _ImageCanvas(QtWidgets.QWidget):
             f"value: {data_val:.4g}",
         ]
         text_width = max((fm.horizontalAdvance(t) for t in lines), default=0)
-        text_height = fm.height() * len(lines) + 10
+        text_height = fm.height() * len(lines)
+        box_width = text_width + (_MARKER_TOOLTIP_H_PADDING * 2)
+        box_height = text_height + (_MARKER_TOOLTIP_V_PADDING * 2)
 
-        box_offset = marker.get("box_offset")
+        box_offset = marker.box_offset
         if box_offset is None:
-            offset_x = 12
-            offset_y = -12
-            box_x = marker_pos.x() + offset_x
-            box_y = marker_pos.y() + offset_y - text_height
-            if box_x + text_width + 14 > self.width():
-                box_x = marker_pos.x() - offset_x - text_width - 14
+            box_x = marker_pos.x() + _MARKER_BOX_OFFSET
+            box_y = marker_pos.y() - _MARKER_BOX_OFFSET - box_height
+            if box_x + box_width > self.width():
+                box_x = marker_pos.x() - _MARKER_BOX_OFFSET - box_width
             if box_y < 0:
-                box_y = marker_pos.y() + offset_x
-            marker["box_offset"] = QtCore.QPointF(
+                box_y = marker_pos.y() + _MARKER_BOX_OFFSET
+            marker.box_offset = QtCore.QPointF(
                 box_x - marker_pos.x(), box_y - marker_pos.y()
             )
         else:
             box_x = marker_pos.x() + float(box_offset.x())
             box_y = marker_pos.y() + float(box_offset.y())
-            margin = 4.0
             box_x = float(
                 clip(
                     box_x,
-                    margin - (text_width + 14),
-                    self.width() - margin,
+                    _MARKER_TOOLTIP_CLAMP_MARGIN - box_width,
+                    self.width() - _MARKER_TOOLTIP_CLAMP_MARGIN,
                 )
             )
             box_y = float(
                 clip(
                     box_y,
-                    margin,
-                    self.height() - margin - text_height,
+                    _MARKER_TOOLTIP_CLAMP_MARGIN,
+                    self.height() - _MARKER_TOOLTIP_CLAMP_MARGIN - box_height,
                 )
             )
-            marker["box_offset"] = QtCore.QPointF(
+            marker.box_offset = QtCore.QPointF(
                 box_x - marker_pos.x(), box_y - marker_pos.y()
             )
 
         box_rect = QtCore.QRectF(
             box_x,
             box_y,
-            text_width + 14,
-            text_height,
+            box_width,
+            box_height,
         )
         return box_rect, marker_pos, lines
 
     def _marker_hit(
         self, pos: QtCore.QPoint, layout: _Layout
-    ) -> tuple[int, dict[str, object]] | None:
+    ) -> tuple[int, _Marker] | None:
         """Check if a click is close enough to any marker handle."""
         for idx, marker in enumerate(self._markers):
             marker_info = self._marker_position(marker, layout)
             if marker_info is None:
                 continue
             marker_pos, _, _, _ = marker_info
-            if hypot(pos.x() - marker_pos.x(), pos.y() - marker_pos.y()) <= 8.0:
+            if hypot(pos.x() - marker_pos.x(), pos.y() - marker_pos.y()) <= _MARKER_HIT_RADIUS:
                 return idx, marker
         return None
 
     def _marker_box_hit(
         self, pos: QtCore.QPoint, layout: _Layout
-    ) -> tuple[int, dict[str, object]] | None:
+    ) -> tuple[int, _Marker] | None:
         """Check if a click lands on any marker tooltip box."""
         fm = QtGui.QFontMetrics(self.font())
         for idx, marker in enumerate(self._markers):
@@ -1272,7 +1290,7 @@ class _ImageCanvas(QtWidgets.QWidget):
             box_info = self._marker_box_rect(marker, layout, fm)
             if box_info:
                 box_rect, marker_pos, _ = box_info
-                marker["box_offset"] = QtCore.QPointF(
+                marker.box_offset = QtCore.QPointF(
                     box_rect.left() - marker_pos.x(),
                     box_rect.top() - marker_pos.y(),
                 )
@@ -1305,10 +1323,8 @@ class _ImageCanvas(QtWidgets.QWidget):
                 marker = self._markers[idx]
                 if kind == "box":
                     delta = event.pos() - self._box_drag_start
-                    current_offset: QtCore.QPointF = marker.get("box_offset") or QtCore.QPointF(
-                        0, 0
-                    )
-                    marker["box_offset"] = QtCore.QPointF(
+                    current_offset: QtCore.QPointF = marker.box_offset or QtCore.QPointF(0, 0)
+                    marker.box_offset = QtCore.QPointF(
                         current_offset.x() + delta.x(), current_offset.y() + delta.y()
                     )
                     self._box_drag_start = event.pos()
@@ -1690,38 +1706,45 @@ class _ImageCanvas(QtWidgets.QWidget):
             box_rect, marker_pos, lines = box_info
 
             outer_pen = QtGui.QPen(QtGui.QColor("white"))
-            outer_pen.setWidth(4)
+            outer_pen.setWidth(_MARKER_OUTER_WIDTH)
             painter.setPen(outer_pen)
             painter.setBrush(QtCore.Qt.NoBrush)
-            painter.drawEllipse(marker_pos, 6, 6)
+            painter.drawEllipse(marker_pos, _MARKER_RADIUS_OUTER, _MARKER_RADIUS_OUTER)
 
             inner_pen = QtGui.QPen(highlight)
-            inner_pen.setWidth(2)
+            inner_pen.setWidth(_MARKER_INNER_WIDTH)
             painter.setPen(inner_pen)
-            painter.drawEllipse(marker_pos, 5, 5)
+            painter.drawEllipse(marker_pos, _MARKER_RADIUS_INNER, _MARKER_RADIUS_INNER)
             painter.drawLine(
-                marker_pos + QtCore.QPointF(-10, 0),
-                marker_pos + QtCore.QPointF(10, 0),
+                marker_pos + QtCore.QPointF(-_MARKER_CROSS_HALF, 0),
+                marker_pos + QtCore.QPointF(_MARKER_CROSS_HALF, 0),
             )
             painter.drawLine(
-                marker_pos + QtCore.QPointF(0, -10),
-                marker_pos + QtCore.QPointF(0, 10),
+                marker_pos + QtCore.QPointF(0, -_MARKER_CROSS_HALF),
+                marker_pos + QtCore.QPointF(0, _MARKER_CROSS_HALF),
             )
 
             painter.setPen(QtGui.QPen(highlight, 1.5))
             anchor_point = QtCore.QPointF(
-                box_rect.left() + 8, box_rect.top() + box_rect.height() / 2
+                box_rect.left() + _MARKER_ANCHOR_OFFSET,
+                box_rect.top() + box_rect.height() / 2,
             )
             painter.drawLine(marker_pos, anchor_point)
 
             painter.setBrush(QtGui.QColor(255, 255, 255, 235))
             painter.setPen(QtGui.QPen(QtGui.QColor("#444"), 1))
-            painter.drawRoundedRect(box_rect, 6, 6)
+            painter.drawRoundedRect(
+                box_rect,
+                _MARKER_TOOLTIP_CORNER_RADIUS,
+                _MARKER_TOOLTIP_CORNER_RADIUS,
+            )
 
-            text_y = box_rect.top() + 6 + fm.ascent()
+            text_y = box_rect.top() + _MARKER_TOOLTIP_V_PADDING + fm.ascent()
             painter.setPen(QtGui.QPen(QtGui.QColor("#111")))
             for line in lines:
-                painter.drawText(box_rect.left() + 6, text_y, line)
+                painter.drawText(
+                    box_rect.left() + _MARKER_TOOLTIP_H_PADDING, text_y, line
+                )
                 text_y += fm.height()
 
         painter.restore()
