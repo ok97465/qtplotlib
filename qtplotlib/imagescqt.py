@@ -1818,7 +1818,7 @@ class ImageWindow(QtWidgets.QMainWindow):
         interpolation: str = "nearest",
         xaxis: ndarray | None = None,
         yaxis: ndarray | None = None,
-        aspect: str = "equal",
+        aspect: str = "auto",
         xlabel: str = "",
         ylabel: str = "",
         colorbar: bool = False,
