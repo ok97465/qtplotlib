@@ -34,6 +34,11 @@ except ImportError as exc:
     raise ImportError("PySide6 is required to use imagescqt.") from exc
 
 
+def _color_luminance(color: QtGui.QColor) -> float:
+    r, g, b, _ = color.getRgbF()
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
 def _prepare_image_data(data: ndarray) -> ndarray:
     """Validate and coerce incoming image data for display."""
     arr = asarray(data)
@@ -696,25 +701,36 @@ class _ImageCanvas(QtWidgets.QWidget):
             shortcut.activated.connect(handler)
             self._clipboard_shortcuts.append(shortcut)
 
+    def _panel_colors(self) -> tuple[QtGui.QColor, QtGui.QColor, QtGui.QColor]:
+        base = self.palette().color(QtGui.QPalette.Base)
+        text = self.palette().color(QtGui.QPalette.Text)
+        if _color_luminance(base) < 0.45:
+            bg = QtGui.QColor(base).lighter(130)
+            bg.setAlpha(235)
+            border = QtGui.QColor(base).lighter(170)
+            border.setAlpha(200)
+            return bg, border, text
+        bg = QtGui.QColor(255, 255, 255, 235)
+        border = QtGui.QColor(60, 60, 60, 180)
+        text_color = QtGui.QColor(30, 30, 30)
+        return bg, border, text_color
+
     def _ensure_toast(self) -> None:
         """Create a floating toast label for copy feedback."""
         if self._toast_label is not None and self._toast_opacity is not None:
             return
         label = QtWidgets.QLabel(self)
         label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        highlight = self.palette().color(QtGui.QPalette.Highlight)
+        text = self.palette().color(QtGui.QPalette.HighlightedText)
         label.setStyleSheet(
-            """
-            QLabel {
-                color: #0f1720;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                                            stop:0 #f9d65c, stop:1 #f2a52f);
-                border-radius: 10px;
-                border: 1px solid rgba(0, 0, 0, 40);
-                padding: 7px 12px;
-                font-weight: 600;
-                letter-spacing: 0.5px;
-            }
-            """
+            "QLabel {"
+            f"background: {highlight.name()};"
+            f"color: {text.name()};"
+            "border-radius: 8px;"
+            "padding: 6px 10px;"
+            "font-weight: 600;"
+            "}"
         )
         label.hide()
 
@@ -1317,7 +1333,7 @@ class _ImageCanvas(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # type: ignore[override]
         painter = QtGui.QPainter(self)
-        painter.fillRect(self.rect(), QtGui.QColor("white"))
+        painter.fillRect(self.rect(), self.palette().color(QtGui.QPalette.Base))
 
         fm = painter.fontMetrics()
         layout = self._layout(fm)
@@ -1351,7 +1367,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         painter.drawImage(QtCore.QRectF(draw_rect), self._qimage, source_rect)
 
         # Axes lines
-        axis_pen = QtGui.QPen(QtGui.QColor("#444"))
+        axis_pen = QtGui.QPen(self.palette().color(QtGui.QPalette.Text))
         painter.setPen(axis_pen)
         painter.drawLine(
             draw_rect.left(), draw_rect.top(), draw_rect.left(), draw_rect.bottom()
@@ -1986,6 +2002,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         fm = painter.fontMetrics()
         highlight = QtGui.QColor("#d32f2f")
+        panel_bg, panel_border, panel_text = self._panel_colors()
 
         for marker in self._markers:
             box_info = self._marker_box_rect(marker, layout, fm)
@@ -2019,8 +2036,8 @@ class _ImageCanvas(QtWidgets.QWidget):
             )
             painter.drawLine(marker_pos, anchor_point)
 
-            painter.setBrush(QtGui.QColor(255, 255, 255, 235))
-            painter.setPen(QtGui.QPen(QtGui.QColor("#444"), 1))
+            painter.setBrush(panel_bg)
+            painter.setPen(QtGui.QPen(panel_border, 1))
             painter.drawRoundedRect(
                 box_rect,
                 _MARKER_TOOLTIP_CORNER_RADIUS,
@@ -2028,7 +2045,7 @@ class _ImageCanvas(QtWidgets.QWidget):
             )
 
             text_y = box_rect.top() + _MARKER_TOOLTIP_V_PADDING + fm.ascent()
-            painter.setPen(QtGui.QPen(QtGui.QColor("#111")))
+            painter.setPen(QtGui.QPen(panel_text))
             for line in lines:
                 painter.drawText(
                     box_rect.left() + _MARKER_TOOLTIP_H_PADDING, text_y, line
