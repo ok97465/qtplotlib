@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from math import hypot
+from math import cos, hypot, pi, sin
 from typing import Protocol
 
 import numpy as np
@@ -27,6 +27,9 @@ _MARKER_ANCHOR_OFFSET = 8
 _MARKER_TOOLTIP_CORNER_RADIUS = 6
 _TOOLBAR_ICON_SIZE = 20
 _TOOLBAR_ICON_STROKE = 1.6
+_THEME_PROP = "qtplotlibTheme"
+_THEME_DARK = "dark"
+_THEME_LIGHT = "light"
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -37,6 +40,113 @@ except ImportError as exc:
 def _color_luminance(color: QtGui.QColor) -> float:
     r, g, b, _ = color.getRgbF()
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _normalize_theme(theme: str | None) -> str:
+    if not theme:
+        return _THEME_DARK
+    value = theme.lower()
+    if value not in {_THEME_DARK, _THEME_LIGHT}:
+        return _THEME_DARK
+    return value
+
+
+def _theme_palette(theme: str) -> QtGui.QPalette:
+    resolved = _normalize_theme(theme)
+    palette = QtGui.QPalette()
+
+    if resolved == _THEME_DARK:
+        window = QtGui.QColor(32, 33, 36)
+        base = QtGui.QColor(24, 24, 24)
+        alt_base = QtGui.QColor(38, 38, 38)
+        text = QtGui.QColor(235, 235, 235)
+        button = QtGui.QColor(45, 45, 48)
+        highlight = QtGui.QColor(61, 136, 220)
+        highlight_text = QtGui.QColor(255, 255, 255)
+        tooltip_base = QtGui.QColor(45, 45, 48)
+        tooltip_text = QtGui.QColor(245, 245, 245)
+        link = QtGui.QColor(94, 175, 255)
+        placeholder = QtGui.QColor(160, 160, 160)
+        disabled = QtGui.QColor(120, 120, 120)
+    else:
+        window = QtGui.QColor(245, 246, 248)
+        base = QtGui.QColor(255, 255, 255)
+        alt_base = QtGui.QColor(235, 236, 238)
+        text = QtGui.QColor(28, 28, 28)
+        button = QtGui.QColor(240, 240, 240)
+        highlight = QtGui.QColor(49, 114, 201)
+        highlight_text = QtGui.QColor(255, 255, 255)
+        tooltip_base = QtGui.QColor(255, 255, 255)
+        tooltip_text = QtGui.QColor(32, 32, 32)
+        link = QtGui.QColor(34, 105, 200)
+        placeholder = QtGui.QColor(120, 120, 120)
+        disabled = QtGui.QColor(150, 150, 150)
+
+    palette.setColor(QtGui.QPalette.Window, window)
+    palette.setColor(QtGui.QPalette.WindowText, text)
+    palette.setColor(QtGui.QPalette.Base, base)
+    palette.setColor(QtGui.QPalette.AlternateBase, alt_base)
+    palette.setColor(QtGui.QPalette.Text, text)
+    palette.setColor(QtGui.QPalette.Button, button)
+    palette.setColor(QtGui.QPalette.ButtonText, text)
+    palette.setColor(QtGui.QPalette.ToolTipBase, tooltip_base)
+    palette.setColor(QtGui.QPalette.ToolTipText, tooltip_text)
+    palette.setColor(QtGui.QPalette.Highlight, highlight)
+    palette.setColor(QtGui.QPalette.HighlightedText, highlight_text)
+    palette.setColor(QtGui.QPalette.Link, link)
+    palette.setColor(QtGui.QPalette.LinkVisited, link)
+    palette.setColor(QtGui.QPalette.PlaceholderText, placeholder)
+    palette.setColor(
+        QtGui.QPalette.Disabled, QtGui.QPalette.Text, disabled
+    )
+    palette.setColor(
+        QtGui.QPalette.Disabled, QtGui.QPalette.WindowText, disabled
+    )
+    palette.setColor(
+        QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, disabled
+    )
+    return palette
+
+
+def _apply_theme_to_widget(root: QtWidgets.QWidget, theme: str) -> str:
+    resolved = _normalize_theme(theme)
+    palette = _theme_palette(resolved)
+    root.setPalette(palette)
+    root.setProperty(_THEME_PROP, resolved)
+    root.setAutoFillBackground(True)
+
+    if isinstance(root, QtWidgets.QMainWindow):
+        central = root.centralWidget()
+        if central is not None:
+            central.setPalette(palette)
+            central.setAutoFillBackground(True)
+            central.update()
+
+    for toolbar in root.findChildren(QtWidgets.QToolBar):
+        toolbar.setPalette(palette)
+        toolbar.setAutoFillBackground(True)
+        if hasattr(toolbar, "set_theme_state"):
+            toolbar.set_theme_state(resolved)
+        if hasattr(toolbar, "refresh_icons"):
+            toolbar.refresh_icons()
+        toolbar.update()
+
+    root.update()
+    return resolved
+
+
+def _current_theme(widget: QtWidgets.QWidget | None) -> str:
+    if widget is None:
+        return _THEME_DARK
+    theme = widget.property(_THEME_PROP)
+    if isinstance(theme, str):
+        return _normalize_theme(theme)
+    window = widget.window()
+    if window is not None and window is not widget:
+        theme = window.property(_THEME_PROP)
+        if isinstance(theme, str):
+            return _normalize_theme(theme)
+    return _THEME_DARK
 
 
 def _prepare_image_data(data: ndarray) -> ndarray:
@@ -392,6 +502,32 @@ def _draw_save_icon(painter: QtGui.QPainter, size: int) -> None:
     painter.drawEllipse(_rect(size, 0.37, 0.52, 0.18, 0.18))
 
 
+def _draw_sun_icon(painter: QtGui.QPainter, size: int) -> None:
+    center = QtCore.QPointF(0.5 * size, 0.5 * size)
+    radius = 0.18 * size
+    painter.drawEllipse(center, radius, radius)
+    inner = radius + 0.06 * size
+    outer = radius + 0.2 * size
+    for idx in range(8):
+        angle = idx * (pi / 4.0)
+        start = QtCore.QPointF(
+            center.x() + cos(angle) * inner, center.y() + sin(angle) * inner
+        )
+        end = QtCore.QPointF(
+            center.x() + cos(angle) * outer, center.y() + sin(angle) * outer
+        )
+        painter.drawLine(start, end)
+
+
+def _draw_moon_icon(painter: QtGui.QPainter, size: int) -> None:
+    outer = _rect(size, 0.2, 0.18, 0.6, 0.6)
+    inner = _rect(size, 0.34, 0.18, 0.6, 0.6)
+    start_angle = 40 * 16
+    span_angle = 280 * 16
+    painter.drawArc(outer, start_angle, span_angle)
+    painter.drawArc(inner, start_angle, span_angle)
+
+
 def _make_toolbar_icon(name: str, size: int, color: QtGui.QColor) -> QtGui.QIcon:
     pixmap = QtGui.QPixmap(size, size)
     pixmap.fill(QtCore.Qt.transparent)
@@ -415,6 +551,10 @@ def _make_toolbar_icon(name: str, size: int, color: QtGui.QColor) -> QtGui.QIcon
         _draw_clipboard_icon(painter, size, detail=False)
     elif name == "save_png":
         _draw_save_icon(painter, size)
+    elif name == "theme_light":
+        _draw_sun_icon(painter, size)
+    elif name == "theme_dark":
+        _draw_moon_icon(painter, size)
     else:
         painter.drawRect(_rect(size, 0.2, 0.2, 0.6, 0.6))
     painter.end()
@@ -435,6 +575,7 @@ class FigureToolbar(QtWidgets.QToolBar):
         self._controller = controller
         self._zoom_actions: dict[str, QtGui.QAction] = {}
         self._actions: dict[str, QtGui.QAction] = {}
+        self._icon_names: dict[str, str] = {}
         self._syncing = False
 
         self.setIconSize(QtCore.QSize(icon_size, icon_size))
@@ -442,6 +583,7 @@ class FigureToolbar(QtWidgets.QToolBar):
         self.setMovable(False)
         self._build_actions(icon_size)
         self._sync_zoom_actions(getattr(controller, "zoom_axis_mode", "off"))
+        self.set_theme_state(_current_theme(self.window()))
 
         zoom_signal = getattr(controller, "zoomModeChanged", None)
         if zoom_signal is not None and hasattr(zoom_signal, "connect"):
@@ -504,6 +646,14 @@ class FigureToolbar(QtWidgets.QToolBar):
                 icon_name="save_png",
                 shortcut="S",
             ),
+            _ToolbarActionSpec(
+                key="theme",
+                text="Theme",
+                tooltip="Switch to light theme",
+                icon_name="theme_light",
+                separator_before=True,
+                shortcut="T",
+            ),
         ]
 
         for spec in specs:
@@ -511,17 +661,15 @@ class FigureToolbar(QtWidgets.QToolBar):
                 self.addSeparator()
             icon = _make_toolbar_icon(spec.icon_name, icon_size, base_color)
             action = QtGui.QAction(icon, spec.text, self)
-            tooltip = spec.tooltip
             action.setCheckable(spec.checkable)
             if spec.shortcut:
                 sequence = QtGui.QKeySequence(spec.shortcut)
                 action.setShortcut(sequence)
                 action.setShortcutContext(QtCore.Qt.WindowShortcut)
-                tooltip = f"{tooltip} ({sequence.toString(QtGui.QKeySequence.NativeText)})"
-            action.setToolTip(tooltip)
-            action.setStatusTip(tooltip)
+            self._apply_action_tooltip(action, spec.tooltip)
             self.addAction(action)
             self._actions[spec.key] = action
+            self._icon_names[spec.key] = spec.icon_name
             if spec.key in {"zoom", "zoom_x", "zoom_y"}:
                 self._zoom_actions[spec.key] = action
 
@@ -532,6 +680,61 @@ class FigureToolbar(QtWidgets.QToolBar):
         self._actions["copy_axes"].triggered.connect(self._controller.copy_axes_to_clipboard)
         self._actions["copy_figure"].triggered.connect(self._controller.copy_figure_to_clipboard)
         self._actions["save_png"].triggered.connect(self._controller.save_figure_to_png)
+        self._actions["theme"].triggered.connect(self._handle_theme_toggle)
+
+    def _apply_action_tooltip(self, action: QtGui.QAction, base: str) -> None:
+        sequence = action.shortcut()
+        if not sequence.isEmpty():
+            tooltip = f"{base} ({sequence.toString(QtGui.QKeySequence.NativeText)})"
+        else:
+            tooltip = base
+        action.setToolTip(tooltip)
+        action.setStatusTip(tooltip)
+
+    def _update_action_icon(self, key: str) -> None:
+        action = self._actions.get(key)
+        icon_name = self._icon_names.get(key)
+        if action is None or icon_name is None:
+            return
+        size = self.iconSize().width()
+        base_color = self.palette().color(QtGui.QPalette.Text)
+        action.setIcon(_make_toolbar_icon(icon_name, size, base_color))
+
+    def refresh_icons(self) -> None:
+        for key in self._actions:
+            self._update_action_icon(key)
+
+    def set_theme_state(self, theme: str) -> None:
+        resolved = _normalize_theme(theme)
+        if resolved == _THEME_DARK:
+            icon_name = "theme_light"
+            tooltip = "Switch to light theme"
+        else:
+            icon_name = "theme_dark"
+            tooltip = "Switch to dark theme"
+        self._icon_names["theme"] = icon_name
+        action = self._actions.get("theme")
+        if action is None:
+            return
+        self._apply_action_tooltip(action, tooltip)
+        self._update_action_icon("theme")
+
+    def _handle_theme_toggle(self) -> None:
+        window = self.window()
+        if window is None:
+            return
+        toggle = getattr(window, "toggle_theme", None)
+        if callable(toggle):
+            toggle()
+            return
+        current = _current_theme(window)
+        next_theme = _THEME_LIGHT if current == _THEME_DARK else _THEME_DARK
+        _apply_theme_to_widget(window, next_theme)
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
+        if event.type() == QtCore.QEvent.PaletteChange:
+            self.refresh_icons()
+        super().changeEvent(event)
 
     def _handle_home(self) -> None:
         self._controller.reset_view()
@@ -2151,6 +2354,22 @@ class ImageWindow(QtWidgets.QMainWindow):
         self._toolbar.setObjectName("qtplotlibToolbar")
         self.addToolBar(QtCore.Qt.TopToolBarArea, self._toolbar)
         self.resize(720, 540)
+        self._theme = _THEME_DARK
+        self.set_theme(self._theme)
+
+    def theme(self) -> str:
+        """Return the active theme name."""
+        return self._theme
+
+    def set_theme(self, theme: str) -> None:
+        """Apply a light or dark theme to the window."""
+        self._theme = _apply_theme_to_widget(self, theme)
+        self._canvas.update()
+
+    def toggle_theme(self) -> None:
+        """Toggle between light and dark themes."""
+        next_theme = _THEME_LIGHT if self._theme == _THEME_DARK else _THEME_DARK
+        self.set_theme(next_theme)
 
     def set_image(
         self,

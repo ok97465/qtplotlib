@@ -13,7 +13,7 @@ try:
 except ImportError as exc:
     raise ImportError("PySide6 is required to use plotqt.") from exc
 
-from .imagescqt import FigureToolbar
+from .imagescqt import FigureToolbar, _apply_theme_to_widget
 
 _TICK_LEN = 6
 _DEFAULT_COLORS = (
@@ -1241,6 +1241,22 @@ class PlotWindow(QtWidgets.QMainWindow):
         self._toolbar.setObjectName("qtplotlibToolbar")
         self.addToolBar(QtCore.Qt.TopToolBarArea, self._toolbar)
         self.resize(800, 560)
+        self._theme = "dark"
+        self.set_theme(self._theme)
+
+    def theme(self) -> str:
+        """Return the active theme name."""
+        return self._theme
+
+    def set_theme(self, theme: str) -> None:
+        """Apply a light or dark theme to the window."""
+        self._theme = _apply_theme_to_widget(self, theme)
+        self._canvas.update()
+
+    def toggle_theme(self) -> None:
+        """Toggle between light and dark themes."""
+        next_theme = "light" if self._theme == "dark" else "dark"
+        self.set_theme(next_theme)
 
     def plot(
         self,
