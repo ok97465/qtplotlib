@@ -1,8 +1,9 @@
-"""Lightweight PySide6 viewer similar to MATLAB's imagesc."""
+"""Lightweight PySide6 viewer similar to MATLAB's imagesc with a Qt toolbar."""
 
 import warnings
 from dataclasses import dataclass
 from math import hypot
+from typing import Protocol
 
 import numpy as np
 from matplotlib import cm
@@ -24,6 +25,8 @@ _MARKER_TOOLTIP_V_PADDING = 5
 _MARKER_TOOLTIP_CLAMP_MARGIN = 4.0
 _MARKER_ANCHOR_OFFSET = 8
 _MARKER_TOOLTIP_CORNER_RADIUS = 6
+_TOOLBAR_ICON_SIZE = 20
+_TOOLBAR_ICON_STROKE = 1.6
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -307,8 +310,256 @@ class _Marker:
     box_offset: QtCore.QPointF | None = None
 
 
+@dataclass(frozen=True)
+class _ToolbarActionSpec:
+    key: str
+    text: str
+    tooltip: str
+    icon_name: str
+    shortcut: str | None = None
+    checkable: bool = False
+    separator_before: bool = False
+
+
+class _ToolbarController(Protocol):
+    def reset_view(self) -> None:
+        """Reset the view and interaction modes to defaults."""
+
+    def set_zoom_axis_mode(self, mode: str) -> None:
+        """Switch zoom mode (off, xy, x, y)."""
+
+    @property
+    def zoom_axis_mode(self) -> str:
+        """Return the current zoom mode."""
+
+    def copy_axes_to_clipboard(self) -> None:
+        """Copy only the axes region to the clipboard."""
+
+    def copy_figure_to_clipboard(self) -> None:
+        """Copy the full figure area to the clipboard."""
+
+    def save_figure_to_png(self) -> None:
+        """Save the full figure area as a PNG image."""
+
+
+def _pt(size: int, x: float, y: float) -> QtCore.QPointF:
+    return QtCore.QPointF(x * size, y * size)
+
+
+def _rect(size: int, x: float, y: float, w: float, h: float) -> QtCore.QRectF:
+    return QtCore.QRectF(x * size, y * size, w * size, h * size)
+
+
+def _draw_home_icon(painter: QtGui.QPainter, size: int) -> None:
+    roof = QtGui.QPainterPath()
+    roof.moveTo(_pt(size, 0.2, 0.56))
+    roof.lineTo(_pt(size, 0.5, 0.24))
+    roof.lineTo(_pt(size, 0.8, 0.56))
+    painter.drawPath(roof)
+    painter.drawRect(_rect(size, 0.3, 0.56, 0.4, 0.3))
+    painter.drawRect(_rect(size, 0.47, 0.67, 0.12, 0.19))
+
+
+def _draw_zoom_icon(painter: QtGui.QPainter, size: int, axis: str) -> None:
+    center = _pt(size, 0.42, 0.42)
+    radius = 0.22 * size
+    painter.drawEllipse(center, radius, radius)
+    painter.drawLine(_pt(size, 0.58, 0.58), _pt(size, 0.82, 0.82))
+    if axis in {"xy", "both"}:
+        painter.drawLine(_pt(size, 0.32, 0.42), _pt(size, 0.52, 0.42))
+        painter.drawLine(_pt(size, 0.42, 0.32), _pt(size, 0.42, 0.52))
+    elif axis == "x":
+        painter.drawLine(_pt(size, 0.32, 0.42), _pt(size, 0.52, 0.42))
+    elif axis == "y":
+        painter.drawLine(_pt(size, 0.42, 0.32), _pt(size, 0.42, 0.52))
+
+
+def _draw_clipboard_icon(painter: QtGui.QPainter, size: int, *, detail: bool) -> None:
+    painter.drawRoundedRect(_rect(size, 0.28, 0.3, 0.44, 0.52), 2.2, 2.2)
+    painter.drawRoundedRect(_rect(size, 0.38, 0.18, 0.24, 0.14), 1.6, 1.6)
+    if detail:
+        painter.drawRect(_rect(size, 0.34, 0.44, 0.32, 0.26))
+
+
+def _draw_save_icon(painter: QtGui.QPainter, size: int) -> None:
+    painter.drawRoundedRect(_rect(size, 0.2, 0.22, 0.6, 0.56), 2.2, 2.2)
+    painter.drawRect(_rect(size, 0.3, 0.26, 0.4, 0.16))
+    painter.drawEllipse(_rect(size, 0.37, 0.52, 0.18, 0.18))
+
+
+def _make_toolbar_icon(name: str, size: int, color: QtGui.QColor) -> QtGui.QIcon:
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    stroke = max(_TOOLBAR_ICON_STROKE, size * 0.08)
+    pen = QtGui.QPen(color, stroke, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(QtCore.Qt.NoBrush)
+    if name == "home":
+        _draw_home_icon(painter, size)
+    elif name == "zoom":
+        _draw_zoom_icon(painter, size, "xy")
+    elif name == "zoom_x":
+        _draw_zoom_icon(painter, size, "x")
+    elif name == "zoom_y":
+        _draw_zoom_icon(painter, size, "y")
+    elif name == "copy_axes":
+        _draw_clipboard_icon(painter, size, detail=True)
+    elif name == "copy_figure":
+        _draw_clipboard_icon(painter, size, detail=False)
+    elif name == "save_png":
+        _draw_save_icon(painter, size)
+    else:
+        painter.drawRect(_rect(size, 0.2, 0.2, 0.6, 0.6))
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
+class FigureToolbar(QtWidgets.QToolBar):
+    """Matplotlib-like toolbar with extensible action specs."""
+
+    def __init__(
+        self,
+        controller: _ToolbarController,
+        *,
+        icon_size: int = _TOOLBAR_ICON_SIZE,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__("Figure Toolbar", parent)
+        self._controller = controller
+        self._zoom_actions: dict[str, QtGui.QAction] = {}
+        self._actions: dict[str, QtGui.QAction] = {}
+        self._syncing = False
+
+        self.setIconSize(QtCore.QSize(icon_size, icon_size))
+        self.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.setMovable(False)
+        self._build_actions(icon_size)
+        self._sync_zoom_actions(getattr(controller, "zoom_axis_mode", "off"))
+
+        zoom_signal = getattr(controller, "zoomModeChanged", None)
+        if zoom_signal is not None and hasattr(zoom_signal, "connect"):
+            zoom_signal.connect(self._sync_zoom_actions)
+
+    def _build_actions(self, icon_size: int) -> None:
+        palette = self.palette()
+        base_color = palette.color(QtGui.QPalette.Text)
+        specs = [
+            _ToolbarActionSpec(
+                key="home",
+                text="Home",
+                tooltip="Reset view",
+                icon_name="home",
+                shortcut="R",
+            ),
+            _ToolbarActionSpec(
+                key="zoom",
+                text="Zoom",
+                tooltip="Zoom (both axes)",
+                icon_name="zoom",
+                checkable=True,
+                shortcut="Z",
+            ),
+            _ToolbarActionSpec(
+                key="zoom_x",
+                text="Zoom X",
+                tooltip="Zoom horizontally",
+                icon_name="zoom_x",
+                checkable=True,
+                shortcut="H",
+            ),
+            _ToolbarActionSpec(
+                key="zoom_y",
+                text="Zoom Y",
+                tooltip="Zoom vertically",
+                icon_name="zoom_y",
+                checkable=True,
+                shortcut="V",
+            ),
+            _ToolbarActionSpec(
+                key="copy_axes",
+                text="Copy Axes",
+                tooltip="Copy axes area to clipboard",
+                icon_name="copy_axes",
+                separator_before=True,
+                shortcut="Shift+Y",
+            ),
+            _ToolbarActionSpec(
+                key="copy_figure",
+                text="Copy Figure",
+                tooltip="Copy full figure to clipboard",
+                icon_name="copy_figure",
+                shortcut="Y",
+            ),
+            _ToolbarActionSpec(
+                key="save_png",
+                text="Save PNG",
+                tooltip="Save figure as PNG",
+                icon_name="save_png",
+                shortcut="S",
+            ),
+        ]
+
+        for spec in specs:
+            if spec.separator_before:
+                self.addSeparator()
+            icon = _make_toolbar_icon(spec.icon_name, icon_size, base_color)
+            action = QtGui.QAction(icon, spec.text, self)
+            tooltip = spec.tooltip
+            action.setCheckable(spec.checkable)
+            if spec.shortcut:
+                sequence = QtGui.QKeySequence(spec.shortcut)
+                action.setShortcut(sequence)
+                action.setShortcutContext(QtCore.Qt.WindowShortcut)
+                tooltip = f"{tooltip} ({sequence.toString(QtGui.QKeySequence.NativeText)})"
+            action.setToolTip(tooltip)
+            action.setStatusTip(tooltip)
+            self.addAction(action)
+            self._actions[spec.key] = action
+            if spec.key in {"zoom", "zoom_x", "zoom_y"}:
+                self._zoom_actions[spec.key] = action
+
+        self._actions["home"].triggered.connect(self._handle_home)
+        self._actions["zoom"].toggled.connect(lambda checked: self._handle_zoom("xy", checked))
+        self._actions["zoom_x"].toggled.connect(lambda checked: self._handle_zoom("x", checked))
+        self._actions["zoom_y"].toggled.connect(lambda checked: self._handle_zoom("y", checked))
+        self._actions["copy_axes"].triggered.connect(self._controller.copy_axes_to_clipboard)
+        self._actions["copy_figure"].triggered.connect(self._controller.copy_figure_to_clipboard)
+        self._actions["save_png"].triggered.connect(self._controller.save_figure_to_png)
+
+    def _handle_home(self) -> None:
+        self._controller.reset_view()
+        self._sync_zoom_actions(getattr(self._controller, "zoom_axis_mode", "off"))
+
+    def _handle_zoom(self, mode: str, checked: bool) -> None:
+        if self._syncing:
+            return
+        if checked:
+            self._controller.set_zoom_axis_mode(mode)
+            self._sync_zoom_actions(mode)
+        else:
+            current = getattr(self._controller, "zoom_axis_mode", "off")
+            if current == mode:
+                self._controller.set_zoom_axis_mode("off")
+            self._sync_zoom_actions(getattr(self._controller, "zoom_axis_mode", "off"))
+
+    def _sync_zoom_actions(self, mode: str) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        if mode not in {"xy", "x", "y"}:
+            mode = "off"
+        mapping = {"xy": "zoom", "x": "zoom_x", "y": "zoom_y"}
+        for key, action in self._zoom_actions.items():
+            action.setChecked(mapping.get(mode) == key)
+        self._syncing = False
+
+
 class _ImageCanvas(QtWidgets.QWidget):
     """Custom widget that draws image plus axes, ticks, and labels."""
+
+    zoomModeChanged = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -408,6 +659,22 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._rubber_band_kind = None
         self._zoom_alt = False
         self._update_zoom_cursor()
+        self.zoomModeChanged.emit(self._zoom_axis_mode)
+
+    @property
+    def zoom_axis_mode(self) -> str:
+        """Return the current zoom mode (off, xy, x, y)."""
+        return self._zoom_axis_mode
+
+    def set_zoom_axis_mode(self, mode: str) -> None:
+        """Set the active zoom axis mode."""
+        self._set_zoom_mode(mode)
+
+    def reset_view(self) -> None:
+        """Reset zoom and interaction settings to their defaults."""
+        self._drag_mode = "pan"
+        self._set_zoom_mode("off")
+        self._reset_zoom()
 
     def _init_clipboard_shortcuts(self) -> None:
         """Register shortcuts for copying the window or data region to the clipboard."""
@@ -513,15 +780,14 @@ class _ImageCanvas(QtWidgets.QWidget):
             self._show_copy_notice("Copied")
 
     def _copy_full_window_to_clipboard(self) -> None:
-        """Copy the entire window (minus OS frame) to the clipboard as an image."""
-        target = self.window() or self
-        pixmap = target.grab()
+        """Copy the full figure (axes + labels) to the clipboard as an image."""
+        pixmap = self.grab()
         self._copy_pixmap_to_clipboard(pixmap)
 
     def _save_full_window_to_png(self) -> None:
-        """Open a dialog and save the current window snapshot as a PNG."""
+        """Open a dialog and save the current figure snapshot as a PNG."""
         target = self.window() or self
-        pixmap = target.grab()
+        pixmap = self.grab()
         if pixmap.isNull():
             return
 
@@ -562,6 +828,18 @@ class _ImageCanvas(QtWidgets.QWidget):
             return
         pixmap = self.grab(draw_rect)
         self._copy_pixmap_to_clipboard(pixmap)
+
+    def copy_axes_to_clipboard(self) -> None:
+        """Copy the axes draw area to the clipboard."""
+        self._copy_data_region_to_clipboard()
+
+    def copy_figure_to_clipboard(self) -> None:
+        """Copy the full figure to the clipboard."""
+        self._copy_full_window_to_clipboard()
+
+    def save_figure_to_png(self) -> None:
+        """Save the full figure to a PNG image."""
+        self._save_full_window_to_png()
 
     def _view_window(self) -> tuple[float, float, float, float]:
         """Return normalized view center and size (fractions of full image)."""
@@ -1442,12 +1720,18 @@ class _ImageCanvas(QtWidgets.QWidget):
 
     def _show_mode_menu(self, pos: QtCore.QPoint) -> None:
         """Context menu to toggle drag mode or clear marker."""
+        def _menu_text(label: str, shortcut: str | None = None) -> str:
+            if not shortcut:
+                return label
+            sequence = QtGui.QKeySequence(shortcut)
+            return f"{label} ({sequence.toString(QtGui.QKeySequence.NativeText)})"
+
         fm = QtGui.QFontMetrics(self.font())
         layout = self._current_layout or self._layout(fm)
         menu = QtWidgets.QMenu(self)
-        zoom_action = menu.addAction("확대/축소")
-        zoom_x_action = menu.addAction("가로 확대/축소")
-        zoom_y_action = menu.addAction("세로 확대/축소")
+        zoom_action = menu.addAction(_menu_text("Zoom", "Z"))
+        zoom_x_action = menu.addAction(_menu_text("Zoom X", "H"))
+        zoom_y_action = menu.addAction(_menu_text("Zoom Y", "V"))
         pan_action = menu.addAction("Pan mode")
         box_action = menu.addAction("Box-zoom mode")
         mode_group = QtGui.QActionGroup(menu)
@@ -1456,9 +1740,13 @@ class _ImageCanvas(QtWidgets.QWidget):
             mode_group.addAction(act)
         mode_group.setExclusive(True)
         menu.addSeparator()
-        copy_window_action = menu.addAction("Copy window to clipboard")
-        copy_data_action = menu.addAction("Copy data area to clipboard")
-        save_png_action = menu.addAction("Save window as PNG...")
+        copy_window_action = menu.addAction(
+            _menu_text("Copy figure to clipboard", "Y")
+        )
+        copy_data_action = menu.addAction(
+            _menu_text("Copy axes area to clipboard", "Shift+Y")
+        )
+        save_png_action = menu.addAction(_menu_text("Save figure as PNG...", "S"))
         delete_action = None
         hit_marker = self._marker_hit(pos, layout)
         hit_box = self._marker_box_hit(pos, layout)
@@ -1842,6 +2130,9 @@ class ImageWindow(QtWidgets.QMainWindow):
             colorbar_label=colorbar_label,
         )
         self.setCentralWidget(self._canvas)
+        self._toolbar = FigureToolbar(self._canvas, parent=self)
+        self._toolbar.setObjectName("qtplotlibToolbar")
+        self.addToolBar(QtCore.Qt.TopToolBarArea, self._toolbar)
         self.resize(720, 540)
 
     def set_image(
