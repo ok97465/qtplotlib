@@ -121,7 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=sorted(DEMO_INDEX),
         help="Select which demo to run.",
     )
-    parser.add_argument("--size", type=int, default=240, help="Square data size.")
+    parser.add_argument("--size", type=int, default=3072, help="Square data size.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     parser.add_argument("--cmap", default="viridis", help="Matplotlib colormap name.")
     parser.add_argument(

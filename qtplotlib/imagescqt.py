@@ -33,6 +33,7 @@ _THEME_LIGHT = "light"
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
 except ImportError as exc:
     raise ImportError("PySide6 is required to use imagescqt.") from exc
 
@@ -764,8 +765,8 @@ class FigureToolbar(QtWidgets.QToolBar):
         self._syncing = False
 
 
-class _ImageCanvas(QtWidgets.QWidget):
-    """Custom widget that draws image plus axes, ticks, and labels."""
+class _ImageCanvas(QOpenGLWidget):
+    """OpenGL-backed widget that draws image plus axes, ticks, and labels."""
 
     zoomModeChanged = QtCore.Signal(str)
 
@@ -998,15 +999,41 @@ class _ImageCanvas(QtWidgets.QWidget):
             clipboard.setPixmap(pixmap)
             self._show_copy_notice("Copied")
 
+    def _grab_widget_pixmap(
+        self, rect: QtCore.QRect | None = None
+    ) -> QtGui.QPixmap:
+        """Grab the widget contents using the OpenGL framebuffer."""
+        image = self.grabFramebuffer()
+        if image.isNull():
+            return QtGui.QPixmap()
+        if rect is None:
+            return QtGui.QPixmap.fromImage(image)
+        if rect.isEmpty():
+            return QtGui.QPixmap()
+
+        dpr = image.devicePixelRatio() or self.devicePixelRatioF() or 1.0
+        scaled = QtCore.QRect(
+            int(rect.x() * dpr),
+            int(rect.y() * dpr),
+            int(rect.width() * dpr),
+            int(rect.height() * dpr),
+        )
+        scaled = scaled & QtCore.QRect(0, 0, image.width(), image.height())
+        if scaled.isEmpty():
+            return QtGui.QPixmap()
+        cropped = image.copy(scaled)
+        cropped.setDevicePixelRatio(image.devicePixelRatio())
+        return QtGui.QPixmap.fromImage(cropped)
+
     def _copy_full_window_to_clipboard(self) -> None:
         """Copy the full figure (axes + labels) to the clipboard as an image."""
-        pixmap = self.grab()
+        pixmap = self._grab_widget_pixmap()
         self._copy_pixmap_to_clipboard(pixmap)
 
     def _save_full_window_to_png(self) -> None:
         """Open a dialog and save the current figure snapshot as a PNG."""
         target = self.window() or self
-        pixmap = self.grab()
+        pixmap = self._grab_widget_pixmap()
         if pixmap.isNull():
             return
 
@@ -1045,7 +1072,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         draw_rect: QtCore.QRect = layout.draw_rect
         if draw_rect.isEmpty():
             return
-        pixmap = self.grab(draw_rect)
+        pixmap = self._grab_widget_pixmap(draw_rect)
         self._copy_pixmap_to_clipboard(pixmap)
 
     def copy_axes_to_clipboard(self) -> None:
@@ -1534,7 +1561,7 @@ class _ImageCanvas(QtWidgets.QWidget):
                 return idx, marker
         return None
 
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # type: ignore[override]
+    def paintGL(self) -> None:  # type: ignore[override]
         painter = QtGui.QPainter(self)
         painter.fillRect(self.rect(), self.palette().color(QtGui.QPalette.Base))
 
@@ -1726,6 +1753,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         self._draw_marker(painter, layout)
         self._draw_rubber_band(painter)
         self._schedule_auto_shrink()
+        painter.end()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # type: ignore[override]
         """Keep toast anchored near the corner on resize."""
@@ -1737,7 +1765,7 @@ class _ImageCanvas(QtWidgets.QWidget):
         delta = event.angleDelta().y()
         if delta == 0:
             return
-        step = 1.1 if delta > 0 else 0.9
+        step = 1.3 if delta > 0 else 1.0 / 1.3
         if self._zoom_axis_mode == "x":
             self._zoom_x = max(float(self._zoom_x * step), 1.0)
         elif self._zoom_axis_mode == "y":
