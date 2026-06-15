@@ -1,10 +1,14 @@
 """Lightweight PySide6 viewer similar to MATLAB's imagesc with a Qt toolbar."""
 
+import json
+import re
 import warnings
 from dataclasses import dataclass
 from math import cos, hypot, pi, sin
+from pathlib import Path
 from typing import Protocol
 
+import IPython
 import numpy as np
 from matplotlib import cm
 from numpy import asarray, clip, isfinite, linspace, log10, nan_to_num, ndarray, uint8
@@ -30,6 +34,9 @@ _TOOLBAR_ICON_STROKE = 1.6
 _THEME_PROP = "qtplotlibTheme"
 _THEME_DARK = "dark"
 _THEME_LIGHT = "light"
+_MARKER_MEMORY_NAME = "imagescqt_markers"
+_MARKER_KEYS = ("x", "y", "idx_col", "idx_row", "value")
+_MARKER_MEMORY_STORE: dict[str, dict[str, list[object]]] = {}
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -97,15 +104,9 @@ def _theme_palette(theme: str) -> QtGui.QPalette:
     palette.setColor(QtGui.QPalette.Link, link)
     palette.setColor(QtGui.QPalette.LinkVisited, link)
     palette.setColor(QtGui.QPalette.PlaceholderText, placeholder)
-    palette.setColor(
-        QtGui.QPalette.Disabled, QtGui.QPalette.Text, disabled
-    )
-    palette.setColor(
-        QtGui.QPalette.Disabled, QtGui.QPalette.WindowText, disabled
-    )
-    palette.setColor(
-        QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, disabled
-    )
+    palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Text, disabled)
+    palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.WindowText, disabled)
+    palette.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, disabled)
     return palette
 
 
@@ -228,9 +229,7 @@ def _array_to_qimage(
 ) -> tuple[QtGui.QImage, float, float]:
     """Convert numpy array to QImage using colormap, returning limits used."""
     prepared = _prepare_image_data(data)
-    norm, vmin_resolved, vmax_resolved = _normalize_data(
-        prepared, vmin=vmin, vmax=vmax
-    )
+    norm, vmin_resolved, vmax_resolved = _normalize_data(prepared, vmin=vmin, vmax=vmax)
     rgba_uint8 = _apply_colormap(norm, cmap=cmap)
     height, width = norm.shape
     image = QtGui.QImage(
@@ -457,6 +456,18 @@ class _ToolbarController(Protocol):
     def save_figure_to_png(self) -> None:
         """Save the full figure area as a PNG image."""
 
+    def save_markers_to_file_dialog(self) -> None:
+        """Save data markers through a file dialog."""
+
+    def load_markers_from_file_dialog(self) -> None:
+        """Load data markers through a file dialog."""
+
+    def save_markers_to_memory_default(self) -> None:
+        """Save data markers to the default memory variable."""
+
+    def load_markers_from_memory_default(self) -> None:
+        """Load data markers from the default memory variable."""
+
 
 def _pt(size: int, x: float, y: float) -> QtCore.QPointF:
     return QtCore.QPointF(x * size, y * size)
@@ -503,6 +514,38 @@ def _draw_save_icon(painter: QtGui.QPainter, size: int) -> None:
     painter.drawEllipse(_rect(size, 0.37, 0.52, 0.18, 0.18))
 
 
+def _draw_marker_storage_icon(
+    painter: QtGui.QPainter, size: int, *, target: str, direction: str
+) -> None:
+    marker_center = _pt(size, 0.32, 0.32)
+    marker_radius = size * 0.12
+    painter.drawEllipse(marker_center, marker_radius, marker_radius)
+    painter.drawLine(_pt(size, 0.2, 0.32), _pt(size, 0.44, 0.32))
+    painter.drawLine(_pt(size, 0.32, 0.2), _pt(size, 0.32, 0.44))
+
+    if target == "memory":
+        storage = _rect(size, 0.52, 0.52, 0.3, 0.26)
+        painter.drawRoundedRect(storage, 1.8, 1.8)
+        for pin_x in (0.56, 0.64, 0.72, 0.8):
+            painter.drawLine(_pt(size, pin_x, 0.48), _pt(size, pin_x, 0.52))
+            painter.drawLine(_pt(size, pin_x, 0.78), _pt(size, pin_x, 0.84))
+    else:
+        page = _rect(size, 0.52, 0.5, 0.28, 0.34)
+        painter.drawRect(page)
+        painter.drawLine(_pt(size, 0.68, 0.5), _pt(size, 0.8, 0.62))
+        painter.drawLine(_pt(size, 0.68, 0.5), _pt(size, 0.68, 0.62))
+        painter.drawLine(_pt(size, 0.68, 0.62), _pt(size, 0.8, 0.62))
+
+    if direction == "save":
+        painter.drawLine(_pt(size, 0.42, 0.43), _pt(size, 0.58, 0.59))
+        painter.drawLine(_pt(size, 0.58, 0.59), _pt(size, 0.5, 0.59))
+        painter.drawLine(_pt(size, 0.58, 0.59), _pt(size, 0.58, 0.51))
+    else:
+        painter.drawLine(_pt(size, 0.58, 0.59), _pt(size, 0.42, 0.43))
+        painter.drawLine(_pt(size, 0.42, 0.43), _pt(size, 0.5, 0.43))
+        painter.drawLine(_pt(size, 0.42, 0.43), _pt(size, 0.42, 0.51))
+
+
 def _draw_sun_icon(painter: QtGui.QPainter, size: int) -> None:
     center = QtCore.QPointF(0.5 * size, 0.5 * size)
     radius = 0.18 * size
@@ -535,7 +578,9 @@ def _make_toolbar_icon(name: str, size: int, color: QtGui.QColor) -> QtGui.QIcon
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
     stroke = max(_TOOLBAR_ICON_STROKE, size * 0.08)
-    pen = QtGui.QPen(color, stroke, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
+    pen = QtGui.QPen(
+        color, stroke, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin
+    )
     painter.setPen(pen)
     painter.setBrush(QtCore.Qt.NoBrush)
     if name == "home":
@@ -552,6 +597,14 @@ def _make_toolbar_icon(name: str, size: int, color: QtGui.QColor) -> QtGui.QIcon
         _draw_clipboard_icon(painter, size, detail=False)
     elif name == "save_png":
         _draw_save_icon(painter, size)
+    elif name == "save_markers_file":
+        _draw_marker_storage_icon(painter, size, target="file", direction="save")
+    elif name == "load_markers_file":
+        _draw_marker_storage_icon(painter, size, target="file", direction="load")
+    elif name == "save_markers_memory":
+        _draw_marker_storage_icon(painter, size, target="memory", direction="save")
+    elif name == "load_markers_memory":
+        _draw_marker_storage_icon(painter, size, target="memory", direction="load")
     elif name == "theme_light":
         _draw_sun_icon(painter, size)
     elif name == "theme_dark":
@@ -648,6 +701,31 @@ class FigureToolbar(QtWidgets.QToolBar):
                 shortcut="S",
             ),
             _ToolbarActionSpec(
+                key="save_markers_file",
+                text="Save Markers",
+                tooltip="Save markers to JSON",
+                icon_name="save_markers_file",
+                separator_before=True,
+            ),
+            _ToolbarActionSpec(
+                key="load_markers_file",
+                text="Load Markers",
+                tooltip="Load markers from JSON",
+                icon_name="load_markers_file",
+            ),
+            _ToolbarActionSpec(
+                key="save_markers_memory",
+                text="Save Markers to Memory",
+                tooltip=f"Save markers to '{_MARKER_MEMORY_NAME}'",
+                icon_name="save_markers_memory",
+            ),
+            _ToolbarActionSpec(
+                key="load_markers_memory",
+                text="Load Markers from Memory",
+                tooltip=f"Load markers from '{_MARKER_MEMORY_NAME}'",
+                icon_name="load_markers_memory",
+            ),
+            _ToolbarActionSpec(
                 key="theme",
                 text="Theme",
                 tooltip="Switch to light theme",
@@ -675,12 +753,34 @@ class FigureToolbar(QtWidgets.QToolBar):
                 self._zoom_actions[spec.key] = action
 
         self._actions["home"].triggered.connect(self._handle_home)
-        self._actions["zoom"].toggled.connect(lambda checked: self._handle_zoom("xy", checked))
-        self._actions["zoom_x"].toggled.connect(lambda checked: self._handle_zoom("x", checked))
-        self._actions["zoom_y"].toggled.connect(lambda checked: self._handle_zoom("y", checked))
-        self._actions["copy_axes"].triggered.connect(self._controller.copy_axes_to_clipboard)
-        self._actions["copy_figure"].triggered.connect(self._controller.copy_figure_to_clipboard)
+        self._actions["zoom"].toggled.connect(
+            lambda checked: self._handle_zoom("xy", checked)
+        )
+        self._actions["zoom_x"].toggled.connect(
+            lambda checked: self._handle_zoom("x", checked)
+        )
+        self._actions["zoom_y"].toggled.connect(
+            lambda checked: self._handle_zoom("y", checked)
+        )
+        self._actions["copy_axes"].triggered.connect(
+            self._controller.copy_axes_to_clipboard
+        )
+        self._actions["copy_figure"].triggered.connect(
+            self._controller.copy_figure_to_clipboard
+        )
         self._actions["save_png"].triggered.connect(self._controller.save_figure_to_png)
+        self._actions["save_markers_file"].triggered.connect(
+            self._controller.save_markers_to_file_dialog
+        )
+        self._actions["load_markers_file"].triggered.connect(
+            self._controller.load_markers_from_file_dialog
+        )
+        self._actions["save_markers_memory"].triggered.connect(
+            self._controller.save_markers_to_memory_default
+        )
+        self._actions["load_markers_memory"].triggered.connect(
+            self._controller.load_markers_from_memory_default
+        )
         self._actions["theme"].triggered.connect(self._handle_theme_toggle)
 
     def _apply_action_tooltip(self, action: QtGui.QAction, base: str) -> None:
@@ -818,7 +918,9 @@ class _ImageCanvas(QOpenGLWidget):
         self._rubber_band: QtCore.QRect | None = None
         self._rubber_band_kind: str | None = None  # box or zoom-{axis}
         self._markers: list[_Marker] = []
-        self._drag_target: dict[str, object] | None = None  # {"kind": "marker"/"box", "idx": int}
+        self._drag_target: dict[str, object] | None = (
+            None  # {"kind": "marker"/"box", "idx": int}
+        )
         self._box_drag_start = QtCore.QPoint()
         self._zoom_alt: bool = False
         self._current_layout: _Layout | None = None
@@ -999,9 +1101,7 @@ class _ImageCanvas(QOpenGLWidget):
             clipboard.setPixmap(pixmap)
             self._show_copy_notice("Copied")
 
-    def _grab_widget_pixmap(
-        self, rect: QtCore.QRect | None = None
-    ) -> QtGui.QPixmap:
+    def _grab_widget_pixmap(self, rect: QtCore.QRect | None = None) -> QtGui.QPixmap:
         """Grab the widget contents using the OpenGL framebuffer."""
         image = self.grabFramebuffer()
         if image.isNull():
@@ -1086,6 +1186,122 @@ class _ImageCanvas(QOpenGLWidget):
     def save_figure_to_png(self) -> None:
         """Save the full figure to a PNG image."""
         self._save_full_window_to_png()
+
+    def get_markers(self) -> dict[str, list[object]]:
+        """Return current markers as a dict of x/y/index/value lists."""
+        payload: dict[str, list[object]] = {key: [] for key in _MARKER_KEYS}
+        for marker in self._markers:
+            idx = marker.index
+            if idx is None:
+                continue
+            col_idx, row_idx = idx
+            payload["x"].append(_axis_value(self._xaxis, col_idx))
+            payload["y"].append(_axis_value(self._yaxis, row_idx))
+            payload["idx_col"].append(col_idx)
+            payload["idx_row"].append(row_idx)
+            payload["value"].append(float(np.abs(self._data[row_idx, col_idx])))
+        return payload
+
+    def set_markers(self, markers: dict[str, list[object]]) -> None:
+        """Replace visible markers from a saved marker dict."""
+        self._markers = [
+            _Marker(index=(int(col_idx), int(row_idx)))
+            for col_idx, row_idx in zip(markers["idx_col"], markers["idx_row"])
+        ]
+        self._drag_target = None
+        self.update()
+
+    def save_markers(self, filename: str | Path) -> dict[str, list[object]]:
+        """Save markers to a JSON file and return the saved dict."""
+        payload = self.get_markers()
+        Path(filename).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return payload
+
+    def load_markers(self, filename: str | Path) -> dict[str, list[object]]:
+        """Load markers from a JSON file and return the active marker dict."""
+        payload = json.loads(Path(filename).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or tuple(payload.keys()) != _MARKER_KEYS:
+            raise ValueError("This is not an imagescqt marker file.")
+        self.set_markers(payload)
+        return self.get_markers()
+
+    def save_markers_to_memory(
+        self, name: str = _MARKER_MEMORY_NAME
+    ) -> dict[str, list[object]]:
+        """Save markers to an IPython/Spyder-visible variable."""
+        payload = self.get_markers()
+        _MARKER_MEMORY_STORE[name] = payload
+        get_ipython = IPython.get_ipython
+        if get_ipython is not None:
+            user_ns = getattr(get_ipython(), "user_ns", None)
+            if isinstance(user_ns, dict):
+                user_ns[name] = payload
+        return payload
+
+    def load_markers_from_memory(
+        self, name: str = _MARKER_MEMORY_NAME
+    ) -> dict[str, list[object]]:
+        """Load markers from an IPython/Spyder-visible variable."""
+        user_ns = None
+        get_ipython = IPython.get_ipython
+        if get_ipython is not None:
+            user_ns = getattr(get_ipython(), "user_ns", None)
+        if isinstance(user_ns, dict) and name in user_ns:
+            payload = user_ns[name]
+        else:
+            payload = _MARKER_MEMORY_STORE[name]
+        self.set_markers(payload)
+        return self.get_markers()
+
+    def save_markers_to_file_dialog(self) -> None:
+        """Open a dialog and save current markers as JSON."""
+        target = self.window() or self
+        dialog = QtWidgets.QFileDialog(target, "Save markers")
+        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
+        dialog.setNameFilter("JSON Files (*.json);;All Files (*)")
+        base_name = target.windowTitle() or "imagescqt"
+        safe_name = re.sub(r"[^\w.-]+", "_", base_name).strip("._") or "imagescqt"
+        dialog.selectFile(f"{safe_name}_markers.json")
+        dialog.setDefaultSuffix("json")
+        dialog.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)
+
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        filename_list = dialog.selectedFiles()
+        if not filename_list:
+            return
+        filename = filename_list[0]
+        if not filename.lower().endswith(".json"):
+            filename += ".json"
+        self.save_markers(filename)
+        self._show_copy_notice("Saved markers")
+
+    def load_markers_from_file_dialog(self) -> None:
+        """Open a dialog and load markers from JSON."""
+        target = self.window() or self
+        dialog = QtWidgets.QFileDialog(target, "Load markers")
+        dialog.setAcceptMode(QtWidgets.QFileDialog.AcceptOpen)
+        dialog.setFileMode(QtWidgets.QFileDialog.ExistingFile)
+        dialog.setNameFilter("JSON Files (*.json);;All Files (*)")
+        dialog.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)
+
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        filename_list = dialog.selectedFiles()
+        if not filename_list:
+            return
+        self.load_markers(filename_list[0])
+        self._show_copy_notice("Loaded markers")
+
+    def save_markers_to_memory_default(self) -> None:
+        """Save markers to the default memory variable."""
+        self.save_markers_to_memory()
+        self._show_copy_notice(f"Saved {_MARKER_MEMORY_NAME}")
+
+    def load_markers_from_memory_default(self) -> None:
+        """Load markers from the default memory variable."""
+        self.load_markers_from_memory()
+        self._show_copy_notice(f"Loaded {_MARKER_MEMORY_NAME}")
 
     def _view_window(self) -> tuple[float, float, float, float]:
         """Return normalized view center and size (fractions of full image)."""
@@ -1244,7 +1460,11 @@ class _ImageCanvas(QOpenGLWidget):
             w_pad_px = max(
                 int(
                     round(
-                        (self._tight_w_pad if self._tight_w_pad is not None else self._tight_pad)
+                        (
+                            self._tight_w_pad
+                            if self._tight_w_pad is not None
+                            else self._tight_pad
+                        )
                         * fm.height()
                         * 0.5
                     )
@@ -1254,7 +1474,11 @@ class _ImageCanvas(QOpenGLWidget):
             h_pad_px = max(
                 int(
                     round(
-                        (self._tight_h_pad if self._tight_h_pad is not None else self._tight_pad)
+                        (
+                            self._tight_h_pad
+                            if self._tight_h_pad is not None
+                            else self._tight_pad
+                        )
                         * fm.height()
                         * 0.5
                     )
@@ -1267,7 +1491,9 @@ class _ImageCanvas(QOpenGLWidget):
         ylabel_height = fm.boundingRect(self._ylabel).height() if self._ylabel else 0
         title_height = fm.boundingRect(self._title).height() if self._title else 0
         cbar_label_height = (
-            fm.boundingRect(self._colorbar_label).height() if self._colorbar_label else 0
+            fm.boundingRect(self._colorbar_label).height()
+            if self._colorbar_label
+            else 0
         )
 
         y_tick_block = _TICK_LEN + max_y_label_width
@@ -1447,8 +1673,7 @@ class _ImageCanvas(QOpenGLWidget):
             return None
         col_idx, row_idx = idx
         if not (
-            0 <= row_idx < self._data.shape[0]
-            and 0 <= col_idx < self._data.shape[1]
+            0 <= row_idx < self._data.shape[0] and 0 <= col_idx < self._data.shape[1]
         ):
             marker.index = None
             return None
@@ -1543,7 +1768,10 @@ class _ImageCanvas(QOpenGLWidget):
             if marker_info is None:
                 continue
             marker_pos, _, _, _ = marker_info
-            if hypot(pos.x() - marker_pos.x(), pos.y() - marker_pos.y()) <= _MARKER_HIT_RADIUS:
+            if (
+                hypot(pos.x() - marker_pos.x(), pos.y() - marker_pos.y())
+                <= _MARKER_HIT_RADIUS
+            ):
                 return idx, marker
         return None
 
@@ -1589,8 +1817,7 @@ class _ImageCanvas(QOpenGLWidget):
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self._render_smooth)
         source_rect = QtCore.QRectF(
             (view_state.cx - view_state.width_frac / 2.0) * self._qimage.width(),
-            (view_state.cy - view_state.height_frac / 2.0)
-            * self._qimage.height(),
+            (view_state.cy - view_state.height_frac / 2.0) * self._qimage.height(),
             self._qimage.width() * view_state.width_frac,
             self._qimage.height() * view_state.height_frac,
         )
@@ -1848,7 +2075,9 @@ class _ImageCanvas(QOpenGLWidget):
                 marker = self._markers[idx]
                 if kind == "box":
                     delta = event.pos() - self._box_drag_start
-                    current_offset: QtCore.QPointF = marker.box_offset or QtCore.QPointF(0, 0)
+                    current_offset: QtCore.QPointF = (
+                        marker.box_offset or QtCore.QPointF(0, 0)
+                    )
                     marker.box_offset = QtCore.QPointF(
                         current_offset.x() + delta.x(), current_offset.y() + delta.y()
                     )
@@ -1967,6 +2196,7 @@ class _ImageCanvas(QOpenGLWidget):
 
     def _show_mode_menu(self, pos: QtCore.QPoint) -> None:
         """Context menu to toggle drag mode or clear marker."""
+
         def _menu_text(label: str, shortcut: str | None = None) -> str:
             if not shortcut:
                 return label
@@ -1987,9 +2217,7 @@ class _ImageCanvas(QOpenGLWidget):
             mode_group.addAction(act)
         mode_group.setExclusive(True)
         menu.addSeparator()
-        copy_window_action = menu.addAction(
-            _menu_text("Copy figure to clipboard", "Y")
-        )
+        copy_window_action = menu.addAction(_menu_text("Copy figure to clipboard", "Y"))
         copy_data_action = menu.addAction(
             _menu_text("Copy axes area to clipboard", "Shift+Y")
         )
@@ -2035,7 +2263,11 @@ class _ImageCanvas(QOpenGLWidget):
             self._copy_data_region_to_clipboard()
         elif chosen == save_png_action:
             self._save_full_window_to_png()
-        elif delete_action is not None and chosen == delete_action and target_idx is not None:
+        elif (
+            delete_action is not None
+            and chosen == delete_action
+            and target_idx is not None
+        ):
             self._clear_marker(target_idx)
 
     def _zoom_selection_rect(
@@ -2460,6 +2692,34 @@ class ImageWindow(QtWidgets.QMainWindow):
     def disable_tight_layout(self) -> None:
         """Disable tight_layout and revert to default spacing."""
         self._canvas.disable_tight_layout()
+
+    def get_markers(self) -> dict[str, list[object]]:
+        """Return current data markers as a serializable dict."""
+        return self._canvas.get_markers()
+
+    def set_markers(self, markers: dict[str, list[object]]) -> None:
+        """Replace visible data markers from a marker dict."""
+        self._canvas.set_markers(markers)
+
+    def save_markers(self, filename: str | Path) -> dict[str, list[object]]:
+        """Save data markers to a JSON file."""
+        return self._canvas.save_markers(filename)
+
+    def load_markers(self, filename: str | Path) -> dict[str, list[object]]:
+        """Load data markers from a JSON file."""
+        return self._canvas.load_markers(filename)
+
+    def save_markers_to_memory(
+        self, name: str = _MARKER_MEMORY_NAME
+    ) -> dict[str, list[object]]:
+        """Save data markers to a Spyder/IPython-visible variable."""
+        return self._canvas.save_markers_to_memory(name)
+
+    def load_markers_from_memory(
+        self, name: str = _MARKER_MEMORY_NAME
+    ) -> dict[str, list[object]]:
+        """Load data markers from a Spyder/IPython-visible variable."""
+        return self._canvas.load_markers_from_memory(name)
 
 
 def imagescqt(

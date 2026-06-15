@@ -43,12 +43,23 @@ win.add_colorbar(label="Added later")
 win.tight_layout(pad=1.05, auto_resize=True)  # w_pad/h_pad/rect also supported
 # Disable or keep window size fixed by turning it off or passing auto_resize=False:
 win.disable_tight_layout()
+
+# Data markers can be saved to and loaded from JSON.
+# The stored dict has x, y, idx_col, idx_row, and value keys.
+win.save_markers("markers.json")
+win.load_markers("markers.json")
+
+# In Spyder/IPython, this stores the same dict in the Variable Explorer as
+# imagescqt_markers. The toolbar memory buttons use the same default name.
+win.save_markers_to_memory()
+win.load_markers_from_memory()
 ```
 
 Mouse/keyboard notes:
 - `Shift` + left-click drops a MATLAB-style data marker showing x/y/value (multiple markers are allowed); drag any marker to move it (snaps to nearest sample).
 - Drag each marker's info box to reposition it; the leader line stays attached to that marker, MATLAB-style.
 - Delete a marker via `Delete`/`Backspace` (clears all markers) or right-click on a specific marker/info box and pick "Delete marker".
+- Toolbar marker buttons save/load markers as JSON, or save/load them through the default `imagescqt_markers` memory variable for Spyder/IPython workflows.
 
 The helper will attach to an existing Qt application (ideal for `%gui qt`). If no
 `QApplication` is running, it creates one and blocks until the window closes.
