@@ -468,6 +468,13 @@ class _ToolbarController(Protocol):
     def load_markers_from_memory_default(self) -> None:
         """Load data markers from the default memory variable."""
 
+    @property
+    def marker_tooltips_visible(self) -> bool:
+        """Return whether marker tooltip boxes are visible."""
+
+    def set_marker_tooltips_visible(self, visible: bool) -> None:
+        """Show or hide marker tooltip boxes."""
+
 
 def _pt(size: int, x: float, y: float) -> QtCore.QPointF:
     return QtCore.QPointF(x * size, y * size)
@@ -546,6 +553,18 @@ def _draw_marker_storage_icon(
         painter.drawLine(_pt(size, 0.42, 0.43), _pt(size, 0.42, 0.51))
 
 
+def _draw_marker_tooltip_icon(painter: QtGui.QPainter, size: int) -> None:
+    marker_center = _pt(size, 0.3, 0.64)
+    marker_radius = size * 0.11
+    painter.drawEllipse(marker_center, marker_radius, marker_radius)
+    painter.drawLine(_pt(size, 0.18, 0.64), _pt(size, 0.42, 0.64))
+    painter.drawLine(_pt(size, 0.3, 0.52), _pt(size, 0.3, 0.76))
+    painter.drawLine(marker_center, _pt(size, 0.54, 0.44))
+    painter.drawRoundedRect(_rect(size, 0.48, 0.2, 0.36, 0.34), 2.0, 2.0)
+    painter.drawLine(_pt(size, 0.56, 0.32), _pt(size, 0.76, 0.32))
+    painter.drawLine(_pt(size, 0.56, 0.43), _pt(size, 0.72, 0.43))
+
+
 def _draw_sun_icon(painter: QtGui.QPainter, size: int) -> None:
     center = QtCore.QPointF(0.5 * size, 0.5 * size)
     radius = 0.18 * size
@@ -605,6 +624,8 @@ def _make_toolbar_icon(name: str, size: int, color: QtGui.QColor) -> QtGui.QIcon
         _draw_marker_storage_icon(painter, size, target="memory", direction="save")
     elif name == "load_markers_memory":
         _draw_marker_storage_icon(painter, size, target="memory", direction="load")
+    elif name == "marker_tooltips":
+        _draw_marker_tooltip_icon(painter, size)
     elif name == "theme_light":
         _draw_sun_icon(painter, size)
     elif name == "theme_dark":
@@ -642,6 +663,13 @@ class FigureToolbar(QtWidgets.QToolBar):
         zoom_signal = getattr(controller, "zoomModeChanged", None)
         if zoom_signal is not None and hasattr(zoom_signal, "connect"):
             zoom_signal.connect(self._sync_zoom_actions)
+        marker_tooltip_signal = getattr(
+            controller, "markerTooltipsVisibleChanged", None
+        )
+        if marker_tooltip_signal is not None and hasattr(
+            marker_tooltip_signal, "connect"
+        ):
+            marker_tooltip_signal.connect(self._sync_marker_tooltip_action)
 
     def _build_actions(self, icon_size: int) -> None:
         palette = self.palette()
@@ -701,11 +729,18 @@ class FigureToolbar(QtWidgets.QToolBar):
                 shortcut="S",
             ),
             _ToolbarActionSpec(
+                key="marker_tooltips",
+                text="Marker Tooltips",
+                tooltip="Hide marker tooltips",
+                icon_name="marker_tooltips",
+                checkable=True,
+                separator_before=True,
+            ),
+            _ToolbarActionSpec(
                 key="save_markers_file",
                 text="Save Markers",
                 tooltip="Save markers to JSON",
                 icon_name="save_markers_file",
-                separator_before=True,
             ),
             _ToolbarActionSpec(
                 key="load_markers_file",
@@ -752,6 +787,9 @@ class FigureToolbar(QtWidgets.QToolBar):
             if spec.key in {"zoom", "zoom_x", "zoom_y"}:
                 self._zoom_actions[spec.key] = action
 
+        self._sync_marker_tooltip_action(
+            bool(getattr(self._controller, "marker_tooltips_visible", True))
+        )
         self._actions["home"].triggered.connect(self._handle_home)
         self._actions["zoom"].toggled.connect(
             lambda checked: self._handle_zoom("xy", checked)
@@ -769,6 +807,9 @@ class FigureToolbar(QtWidgets.QToolBar):
             self._controller.copy_figure_to_clipboard
         )
         self._actions["save_png"].triggered.connect(self._controller.save_figure_to_png)
+        self._actions["marker_tooltips"].toggled.connect(
+            self._handle_marker_tooltip_toggle
+        )
         self._actions["save_markers_file"].triggered.connect(
             self._controller.save_markers_to_file_dialog
         )
@@ -832,6 +873,22 @@ class FigureToolbar(QtWidgets.QToolBar):
         next_theme = _THEME_LIGHT if current == _THEME_DARK else _THEME_DARK
         _apply_theme_to_widget(window, next_theme)
 
+    def _handle_marker_tooltip_toggle(self, checked: bool) -> None:
+        if self._syncing:
+            return
+        self._controller.set_marker_tooltips_visible(checked)
+        self._sync_marker_tooltip_action(checked)
+
+    def _sync_marker_tooltip_action(self, visible: bool) -> None:
+        action = self._actions.get("marker_tooltips")
+        if action is None:
+            return
+        self._syncing = True
+        action.setChecked(visible)
+        tooltip = "Hide marker tooltips" if visible else "Show marker tooltips"
+        self._apply_action_tooltip(action, tooltip)
+        self._syncing = False
+
     def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
         if event.type() == QtCore.QEvent.PaletteChange:
             self.refresh_icons()
@@ -869,6 +926,7 @@ class _ImageCanvas(QOpenGLWidget):
     """OpenGL-backed widget that draws image plus axes, ticks, and labels."""
 
     zoomModeChanged = QtCore.Signal(str)
+    markerTooltipsVisibleChanged = QtCore.Signal(bool)
 
     def __init__(
         self,
@@ -918,6 +976,7 @@ class _ImageCanvas(QOpenGLWidget):
         self._rubber_band: QtCore.QRect | None = None
         self._rubber_band_kind: str | None = None  # box or zoom-{axis}
         self._markers: list[_Marker] = []
+        self._marker_tooltips_visible = True
         self._drag_target: dict[str, object] | None = (
             None  # {"kind": "marker"/"box", "idx": int}
         )
@@ -980,6 +1039,22 @@ class _ImageCanvas(QOpenGLWidget):
     def set_zoom_axis_mode(self, mode: str) -> None:
         """Set the active zoom axis mode."""
         self._set_zoom_mode(mode)
+
+    @property
+    def marker_tooltips_visible(self) -> bool:
+        """Return whether marker tooltip boxes are visible."""
+        return self._marker_tooltips_visible
+
+    def set_marker_tooltips_visible(self, visible: bool) -> None:
+        """Show or hide marker tooltip boxes while keeping marker handles visible."""
+        resolved = bool(visible)
+        if self._marker_tooltips_visible == resolved:
+            return
+        self._marker_tooltips_visible = resolved
+        if self._drag_target is not None and self._drag_target.get("kind") == "box":
+            self._drag_target = None
+        self.markerTooltipsVisibleChanged.emit(resolved)
+        self.update()
 
     def reset_view(self) -> None:
         """Reset zoom and interaction settings to their defaults."""
@@ -1779,6 +1854,8 @@ class _ImageCanvas(QOpenGLWidget):
         self, pos: QtCore.QPoint, layout: _Layout
     ) -> tuple[int, _Marker] | None:
         """Check if a click lands on any marker tooltip box."""
+        if not self._marker_tooltips_visible:
+            return None
         fm = QtGui.QFontMetrics(self.font())
         for idx, marker in enumerate(self._markers):
             box_info = self._marker_box_rect(marker, layout, fm)
@@ -2457,7 +2534,7 @@ class _ImageCanvas(QOpenGLWidget):
         self.update()
 
     def _draw_marker(self, painter: QtGui.QPainter, layout: _Layout) -> None:
-        """Render MATLAB-style data markers and tooltips."""
+        """Render MATLAB-style data markers and optional tooltips."""
         if not self._markers:
             return
 
@@ -2468,10 +2545,10 @@ class _ImageCanvas(QOpenGLWidget):
         panel_bg, panel_border, panel_text = self._panel_colors()
 
         for marker in self._markers:
-            box_info = self._marker_box_rect(marker, layout, fm)
-            if box_info is None:
+            marker_info = self._marker_position(marker, layout)
+            if marker_info is None:
                 continue
-            box_rect, marker_pos, lines = box_info
+            marker_pos, _, _, _ = marker_info
 
             outer_pen = QtGui.QPen(QtGui.QColor("white"))
             outer_pen.setWidth(_MARKER_OUTER_WIDTH)
@@ -2491,6 +2568,14 @@ class _ImageCanvas(QOpenGLWidget):
                 marker_pos + QtCore.QPointF(0, -_MARKER_CROSS_HALF),
                 marker_pos + QtCore.QPointF(0, _MARKER_CROSS_HALF),
             )
+
+            if not self._marker_tooltips_visible:
+                continue
+
+            box_info = self._marker_box_rect(marker, layout, fm)
+            if box_info is None:
+                continue
+            box_rect, _, lines = box_info
 
             painter.setPen(QtGui.QPen(highlight, 1.5))
             anchor_point = QtCore.QPointF(
@@ -2696,6 +2781,15 @@ class ImageWindow(QtWidgets.QMainWindow):
     def get_markers(self) -> dict[str, list[object]]:
         """Return current data markers as a serializable dict."""
         return self._canvas.get_markers()
+
+    @property
+    def marker_tooltips_visible(self) -> bool:
+        """Return whether marker tooltip boxes are visible."""
+        return self._canvas.marker_tooltips_visible
+
+    def set_marker_tooltips_visible(self, visible: bool) -> None:
+        """Show or hide marker tooltip boxes."""
+        self._canvas.set_marker_tooltips_visible(visible)
 
     def set_markers(self, markers: dict[str, list[object]]) -> None:
         """Replace visible data markers from a marker dict."""

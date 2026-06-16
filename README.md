@@ -58,6 +58,7 @@ win.load_markers_from_memory()
 Mouse/keyboard notes:
 - `Shift` + left-click drops a MATLAB-style data marker showing x/y/value (multiple markers are allowed); drag any marker to move it (snaps to nearest sample).
 - Drag each marker's info box to reposition it; the leader line stays attached to that marker, MATLAB-style.
+- Use the toolbar marker-tooltip button to show or hide marker info boxes while keeping marker handles visible.
 - Delete a marker via `Delete`/`Backspace` (clears all markers) or right-click on a specific marker/info box and pick "Delete marker".
 - Toolbar marker buttons save/load markers as JSON, or save/load them through the default `imagescqt_markers` memory variable for Spyder/IPython workflows.
 
