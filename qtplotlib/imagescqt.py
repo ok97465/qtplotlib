@@ -3,15 +3,17 @@
 import json
 import re
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import cos, hypot, pi, sin
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Self
 
 import IPython
 import numpy as np
 from matplotlib import cm
-from numpy import asarray, clip, isfinite, linspace, log10, nan_to_num, ndarray, uint8
+from matplotlib import colors as mcolors
+from numpy import ndarray
 
 _COLORMAP_CACHE: dict[str, object] = {}
 _TICK_LEN = 6
@@ -43,6 +45,8 @@ try:
     from PySide6.QtOpenGLWidgets import QOpenGLWidget
 except ImportError as exc:
     raise ImportError("PySide6 is required to use imagescqt.") from exc
+
+MaskColor = str | Sequence[float | int] | QtGui.QColor
 
 
 def _color_luminance(color: QtGui.QColor) -> float:
@@ -153,7 +157,7 @@ def _current_theme(widget: QtWidgets.QWidget | None) -> str:
 
 def _prepare_image_data(data: ndarray) -> ndarray:
     """Validate and coerce incoming image data for display."""
-    arr = asarray(data)
+    arr = np.asarray(data)
     if arr.ndim != 2:
         raise ValueError(f"imagescqt expects a 2D array, got shape {arr.shape}")
     if arr.size == 0:
@@ -174,14 +178,14 @@ def _normalize_data(
     """Normalize array into 0..1 with NaNs sent to middle gray, returning limits used."""
     vmin_resolved, vmax_resolved = _resolve_limits(data, vmin, vmax)
     norm = (data - vmin_resolved) / (vmax_resolved - vmin_resolved)
-    norm = clip(norm, 0.0, 1.0)
-    return nan_to_num(norm, nan=0.5), vmin_resolved, vmax_resolved
+    norm = np.clip(norm, 0.0, 1.0)
+    return np.nan_to_num(norm, nan=0.5), vmin_resolved, vmax_resolved
 
 
 def _resolve_limits(
     data: ndarray, vmin: float | None, vmax: float | None
 ) -> tuple[float, float]:
-    finite_vals = data[isfinite(data)]
+    finite_vals = data[np.isfinite(data)]
     if finite_vals.size == 0:
         vmin = 0.0 if vmin is None else vmin
         vmax = 1.0 if vmax is None else vmax
@@ -207,13 +211,13 @@ def _get_cmap(cmap: str):
 def _apply_colormap(data: ndarray, cmap: str) -> ndarray:
     """Convert normalized data into RGBA image."""
     rgba = _get_cmap(cmap)(data)
-    rgba_uint8 = (clip(rgba, 0.0, 1.0) * 255).astype(uint8)
+    rgba_uint8 = (np.clip(rgba, 0.0, 1.0) * 255).astype(np.uint8)
     return rgba_uint8
 
 
 def _make_colorbar_image(cmap: str, height: int = 256) -> QtGui.QImage:
     """Create a 1-pixel wide vertical colorbar image (top=max, bottom=min)."""
-    grad = linspace(1.0, 0.0, height, dtype=float).reshape(height, 1)
+    grad = np.linspace(1.0, 0.0, height, dtype=float).reshape(height, 1)
     rgba_uint8 = _apply_colormap(grad, cmap=cmap)
     image = QtGui.QImage(
         rgba_uint8.data,
@@ -241,6 +245,80 @@ def _array_to_qimage(
     return image.copy(), vmin_resolved, vmax_resolved
 
 
+def _resolve_mask_alpha(alpha: float) -> float:
+    """Validate a mask alpha value."""
+    value = float(alpha)
+    if not np.isfinite(value) or value < 0.0 or value > 1.0:
+        raise ValueError("mask alpha must be between 0 and 1")
+    return value
+
+
+def _qcolor_from_mask_color(color: MaskColor) -> QtGui.QColor:
+    """Convert a matplotlib-like color specification to QColor."""
+    if isinstance(color, QtGui.QColor):
+        return QtGui.QColor(color)
+
+    normalized: object = color
+    if not isinstance(color, str):
+        try:
+            arr = np.asarray(color, dtype=float)
+        except (TypeError, ValueError):
+            arr = np.asarray([], dtype=float)
+        if arr.ndim == 1 and arr.size in {3, 4} and np.all(np.isfinite(arr)):
+            if float(arr.max()) > 1.0:
+                integer_like = np.all(np.equal(arr, np.round(arr)))
+                if (
+                    not integer_like
+                    or float(arr.min()) < 0.0
+                    or float(arr.max()) > 255.0
+                ):
+                    raise ValueError(
+                        "mask color channels must be 0..1 floats or 0..255 integers"
+                    )
+                normalized = tuple((arr / 255.0).tolist())
+
+    try:
+        r, g, b, a = mcolors.to_rgba(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported mask color {color!r}") from exc
+    return QtGui.QColor.fromRgbF(r, g, b, a)
+
+
+def _prepare_mask_data(mask: ndarray, image_shape: tuple[int, int]) -> ndarray:
+    """Validate and coerce incoming mask data for overlay drawing."""
+    arr = np.asarray(mask)
+    if arr.ndim != 2:
+        raise ValueError(f"mask expects a 2D array, got shape {arr.shape}")
+    if arr.shape != image_shape:
+        raise ValueError(f"mask shape {arr.shape} must match image shape {image_shape}")
+    if arr.dtype == bool:
+        return arr.astype(bool, copy=False)
+    if np.iscomplexobj(arr):
+        arr = np.abs(arr)
+    numeric = arr.astype(float, copy=False)
+    return np.isfinite(numeric) & (numeric != 0.0)
+
+
+def _make_mask_image(mask: ndarray, color: QtGui.QColor, alpha: float) -> QtGui.QImage:
+    """Create an RGBA QImage for one colored mask layer."""
+    alpha_byte = int(round(_resolve_mask_alpha(alpha) * color.alphaF() * 255))
+    height, width = mask.shape
+    rgba_uint8 = np.zeros((height, width, 4), dtype=np.uint8)
+    active = mask.astype(bool, copy=False)
+    if active.any() and alpha_byte > 0:
+        rgba_uint8[active, 0] = color.red()
+        rgba_uint8[active, 1] = color.green()
+        rgba_uint8[active, 2] = color.blue()
+        rgba_uint8[active, 3] = alpha_byte
+    image = QtGui.QImage(
+        rgba_uint8.data,
+        width,
+        height,
+        QtGui.QImage.Format_RGBA8888,
+    )
+    return image.copy()
+
+
 def _transform_mode(interpolation: str) -> QtCore.Qt.TransformationMode:
     """Map interpolation keyword to Qt transformation mode."""
     interpolation = interpolation.lower()
@@ -264,7 +342,7 @@ def _validate_axis(axis: ndarray | None, length: int, name: str) -> ndarray | No
     """Validate optional axis array length."""
     if axis is None:
         return None
-    axis_arr = asarray(axis, dtype=float)
+    axis_arr = np.asarray(axis, dtype=float)
     if axis_arr.ndim != 1 or axis_arr.size != length:
         raise ValueError(
             f"{name} must be 1D with length matching data dimension ({length})"
@@ -304,14 +382,14 @@ def _nearest_index(value: float, axis: ndarray | None, length: int) -> int:
         idx = int(round(value))
     else:
         idx = int(np.abs(axis - value).argmin())
-    return int(clip(idx, 0, length - 1))
+    return int(np.clip(idx, 0, length - 1))
 
 
 def _axis_value(axis: ndarray | None, idx: int) -> float:
     """Return numeric axis value for an index (or index itself)."""
     if axis is None:
         return float(idx)
-    idx = int(clip(idx, 0, axis.size - 1))
+    idx = int(np.clip(idx, 0, axis.size - 1))
     return float(axis[idx])
 
 
@@ -354,11 +432,11 @@ def _parse_axes_and_data(
 
 def _scaled_tick_labels(values: list[float]) -> tuple[list[str], str]:
     """Return labels and optional scale text using scientific notation if needed."""
-    finite = [abs(v) for v in values if isfinite(v) and v != 0]
+    finite = [abs(v) for v in values if np.isfinite(v) and v != 0]
     if not finite:
         return [_format_tick(v) for v in values], ""
     max_abs = max(finite)
-    exp = int(np.floor(log10(max_abs)))
+    exp = int(np.floor(np.log10(max_abs)))
     if exp >= 4 or exp <= -3:
         scale = 10**exp
         scale_text = f"×1e{exp}"
@@ -423,6 +501,18 @@ class _Marker:
 
     index: tuple[int, int] | None
     box_offset: QtCore.QPointF | None = None
+
+
+@dataclass
+class _MaskOverlay:
+    """Internal state for one colored mask overlay."""
+
+    mask: ndarray
+    color: QtGui.QColor
+    alpha: float
+    label: str | None
+    visible: bool
+    qimage: QtGui.QImage
 
 
 @dataclass(frozen=True)
@@ -976,6 +1066,7 @@ class _ImageCanvas(QOpenGLWidget):
         self._rubber_band: QtCore.QRect | None = None
         self._rubber_band_kind: str | None = None  # box or zoom-{axis}
         self._markers: list[_Marker] = []
+        self._mask_layers: list[_MaskOverlay] = []
         self._marker_tooltips_visible = True
         self._drag_target: dict[str, object] | None = (
             None  # {"kind": "marker"/"box", "idx": int}
@@ -1054,6 +1145,112 @@ class _ImageCanvas(QOpenGLWidget):
         if self._drag_target is not None and self._drag_target.get("kind") == "box":
             self._drag_target = None
         self.markerTooltipsVisibleChanged.emit(resolved)
+        self.update()
+
+    def add_mask(
+        self,
+        mask: ndarray,
+        *,
+        color: MaskColor = "red",
+        alpha: float = 0.35,
+        label: str | None = None,
+        visible: bool = True,
+    ) -> "MaskLayer":
+        """Add a colored mask overlay and return its layer handle."""
+        layer = self._create_mask_overlay(
+            mask,
+            color=color,
+            alpha=alpha,
+            label=label,
+            visible=visible,
+        )
+        self._mask_layers.append(layer)
+        self.update()
+        return MaskLayer(self, layer)
+
+    def _create_mask_overlay(
+        self,
+        mask: ndarray,
+        *,
+        color: MaskColor,
+        alpha: float,
+        label: str | None,
+        visible: bool,
+    ) -> _MaskOverlay:
+        prepared = _prepare_mask_data(mask, self._data.shape)
+        qcolor = _qcolor_from_mask_color(color)
+        alpha_resolved = _resolve_mask_alpha(alpha)
+        return _MaskOverlay(
+            mask=prepared,
+            color=qcolor,
+            alpha=alpha_resolved,
+            label=label,
+            visible=bool(visible),
+            qimage=_make_mask_image(prepared, qcolor, alpha_resolved),
+        )
+
+    def set_mask(
+        self,
+        mask: ndarray,
+        *,
+        color: MaskColor = "red",
+        alpha: float = 0.35,
+        label: str | None = None,
+        visible: bool = True,
+    ) -> "MaskLayer":
+        """Replace all mask overlays with one mask layer."""
+        layer = self._create_mask_overlay(
+            mask,
+            color=color,
+            alpha=alpha,
+            label=label,
+            visible=visible,
+        )
+        self._mask_layers = [layer]
+        self.update()
+        return MaskLayer(self, layer)
+
+    def clear_mask(self) -> None:
+        """Remove all mask overlays."""
+        self.clear_masks()
+
+    def clear_masks(self) -> None:
+        """Remove all mask overlays."""
+        if not self._mask_layers:
+            return
+        self._mask_layers.clear()
+        self.update()
+
+    def _refresh_mask_layer(self, layer: _MaskOverlay) -> None:
+        layer.qimage = _make_mask_image(layer.mask, layer.color, layer.alpha)
+        self.update()
+
+    def _set_mask_layer_data(self, layer: _MaskOverlay, mask: ndarray) -> None:
+        layer.mask = _prepare_mask_data(mask, self._data.shape)
+        self._refresh_mask_layer(layer)
+
+    def _set_mask_layer_color(self, layer: _MaskOverlay, color: MaskColor) -> None:
+        layer.color = _qcolor_from_mask_color(color)
+        self._refresh_mask_layer(layer)
+
+    def _set_mask_layer_alpha(self, layer: _MaskOverlay, alpha: float) -> None:
+        layer.alpha = _resolve_mask_alpha(alpha)
+        self._refresh_mask_layer(layer)
+
+    def _set_mask_layer_label(self, layer: _MaskOverlay, label: str | None) -> None:
+        layer.label = label
+
+    def _set_mask_layer_visible(self, layer: _MaskOverlay, visible: bool) -> None:
+        resolved = bool(visible)
+        if layer.visible == resolved:
+            return
+        layer.visible = resolved
+        self.update()
+
+    def _remove_mask_layer(self, layer: _MaskOverlay) -> None:
+        if layer not in self._mask_layers:
+            return
+        self._mask_layers.remove(layer)
         self.update()
 
     def reset_view(self) -> None:
@@ -1384,8 +1581,8 @@ class _ImageCanvas(QOpenGLWidget):
         height_frac = min(1.0, 1.0 / max(self._zoom_y, 1e-9))
         half_w = width_frac / 2.0
         half_h = height_frac / 2.0
-        cx = float(clip(self._view_center.x(), half_w, 1.0 - half_w))
-        cy = float(clip(self._view_center.y(), half_h, 1.0 - half_h))
+        cx = float(np.clip(self._view_center.x(), half_w, 1.0 - half_w))
+        cy = float(np.clip(self._view_center.y(), half_h, 1.0 - half_h))
         self._view_center = QtCore.QPointF(cx, cy)
         return cx, cy, width_frac, height_frac
 
@@ -1419,6 +1616,7 @@ class _ImageCanvas(QOpenGLWidget):
     ) -> None:
         """Update image data and axes."""
         prepared = _prepare_image_data(data)
+        shape_changed = prepared.shape != self._data.shape
         qimage, vmin_resolved, vmax_resolved = _array_to_qimage(
             prepared, cmap=cmap, vmin=vmin, vmax=vmax
         )
@@ -1433,6 +1631,8 @@ class _ImageCanvas(QOpenGLWidget):
         self._update_content_ratio()
         self._reset_zoom_state()
         self._markers = []
+        if shape_changed:
+            self._mask_layers.clear()
         self._drag_target = None
         self._current_layout = None
         self.update()
@@ -1482,10 +1682,10 @@ class _ImageCanvas(QOpenGLWidget):
             r = max(r, l)
             t = max(t, b)
             self._tight_rect = (
-                float(clip(l, 0.0, 1.0)),
-                float(clip(b, 0.0, 1.0)),
-                float(clip(r, 0.0, 1.0)),
-                float(clip(t, 0.0, 1.0)),
+                float(np.clip(l, 0.0, 1.0)),
+                float(np.clip(b, 0.0, 1.0)),
+                float(np.clip(r, 0.0, 1.0)),
+                float(np.clip(t, 0.0, 1.0)),
             )
         else:
             self._tight_rect = (0.0, 0.0, 1.0, 1.0)
@@ -1809,14 +2009,14 @@ class _ImageCanvas(QOpenGLWidget):
             box_x = marker_pos.x() + float(box_offset.x())
             box_y = marker_pos.y() + float(box_offset.y())
             box_x = float(
-                clip(
+                np.clip(
                     box_x,
                     _MARKER_TOOLTIP_CLAMP_MARGIN - box_width,
                     self.width() - _MARKER_TOOLTIP_CLAMP_MARGIN,
                 )
             )
             box_y = float(
-                clip(
+                np.clip(
                     box_y,
                     _MARKER_TOOLTIP_CLAMP_MARGIN,
                     self.height() - _MARKER_TOOLTIP_CLAMP_MARGIN - box_height,
@@ -1899,6 +2099,7 @@ class _ImageCanvas(QOpenGLWidget):
             self._qimage.height() * view_state.height_frac,
         )
         painter.drawImage(QtCore.QRectF(draw_rect), self._qimage, source_rect)
+        self._draw_masks(painter, draw_rect, source_rect)
 
         # Axes lines
         axis_pen = QtGui.QPen(self.palette().color(QtGui.QPalette.Text))
@@ -2533,6 +2734,23 @@ class _ImageCanvas(QOpenGLWidget):
         self._drag_target = None
         self.update()
 
+    def _draw_masks(
+        self,
+        painter: QtGui.QPainter,
+        draw_rect: QtCore.QRect,
+        source_rect: QtCore.QRectF,
+    ) -> None:
+        """Draw visible mask overlays in data coordinates."""
+        if not self._mask_layers:
+            return
+
+        target_rect = QtCore.QRectF(draw_rect)
+        painter.save()
+        for layer in self._mask_layers:
+            if layer.visible and not layer.qimage.isNull():
+                painter.drawImage(target_rect, layer.qimage, source_rect)
+        painter.restore()
+
     def _draw_marker(self, painter: QtGui.QPainter, layout: _Layout) -> None:
         """Render MATLAB-style data markers and optional tooltips."""
         if not self._markers:
@@ -2657,6 +2875,63 @@ class _ImageCanvas(QOpenGLWidget):
         self._tight_auto_resize_pending = False
 
 
+class MaskLayer:
+    """Mutable handle for one mask overlay layer."""
+
+    def __init__(self, canvas: _ImageCanvas, overlay: _MaskOverlay) -> None:
+        self._canvas = canvas
+        self._overlay = overlay
+
+    @property
+    def alpha(self) -> float:
+        """Return the layer opacity."""
+        return self._overlay.alpha
+
+    @property
+    def color(self) -> QtGui.QColor:
+        """Return the layer color."""
+        return QtGui.QColor(self._overlay.color)
+
+    @property
+    def label(self) -> str | None:
+        """Return the layer label."""
+        return self._overlay.label
+
+    @property
+    def visible(self) -> bool:
+        """Return whether the layer is visible."""
+        return self._overlay.visible
+
+    def set_data(self, mask: ndarray) -> Self:
+        """Replace the mask data."""
+        self._canvas._set_mask_layer_data(self._overlay, mask)
+        return self
+
+    def set_alpha(self, alpha: float) -> Self:
+        """Set the layer opacity."""
+        self._canvas._set_mask_layer_alpha(self._overlay, alpha)
+        return self
+
+    def set_color(self, color: MaskColor) -> Self:
+        """Set the layer color."""
+        self._canvas._set_mask_layer_color(self._overlay, color)
+        return self
+
+    def set_label(self, label: str | None) -> Self:
+        """Set the layer label."""
+        self._canvas._set_mask_layer_label(self._overlay, label)
+        return self
+
+    def set_visible(self, visible: bool) -> Self:
+        """Show or hide the layer."""
+        self._canvas._set_mask_layer_visible(self._overlay, visible)
+        return self
+
+    def remove(self) -> None:
+        """Remove this layer from the canvas."""
+        self._canvas._remove_mask_layer(self._overlay)
+
+
 class ImageWindow(QtWidgets.QMainWindow):
     """Basic window that displays a single 2D numpy array as an image."""
 
@@ -2676,6 +2951,10 @@ class ImageWindow(QtWidgets.QMainWindow):
         ylabel: str = "",
         colorbar: bool = False,
         colorbar_label: str = "",
+        mask: ndarray | None = None,
+        mask_color: MaskColor = "red",
+        mask_alpha: float = 0.35,
+        mask_label: str | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle(title)
@@ -2694,6 +2973,13 @@ class ImageWindow(QtWidgets.QMainWindow):
             colorbar=colorbar,
             colorbar_label=colorbar_label,
         )
+        if mask is not None:
+            self._canvas.add_mask(
+                mask,
+                color=mask_color,
+                alpha=mask_alpha,
+                label=mask_label,
+            )
         self.setCentralWidget(self._canvas)
         self._toolbar = FigureToolbar(self._canvas, parent=self)
         self._toolbar.setObjectName("qtplotlibToolbar")
@@ -2732,6 +3018,50 @@ class ImageWindow(QtWidgets.QMainWindow):
         self._canvas.set_image(
             data_arg, cmap=cmap, vmin=vmin, vmax=vmax, xaxis=xaxis_arg, yaxis=yaxis_arg
         )
+
+    def add_mask(
+        self,
+        mask: ndarray,
+        *,
+        color: MaskColor = "red",
+        alpha: float = 0.35,
+        label: str | None = None,
+        visible: bool = True,
+    ) -> MaskLayer:
+        """Add a colored mask overlay and return its layer handle."""
+        return self._canvas.add_mask(
+            mask,
+            color=color,
+            alpha=alpha,
+            label=label,
+            visible=visible,
+        )
+
+    def set_mask(
+        self,
+        mask: ndarray,
+        *,
+        color: MaskColor = "red",
+        alpha: float = 0.35,
+        label: str | None = None,
+        visible: bool = True,
+    ) -> MaskLayer:
+        """Replace all mask overlays with one mask layer."""
+        return self._canvas.set_mask(
+            mask,
+            color=color,
+            alpha=alpha,
+            label=label,
+            visible=visible,
+        )
+
+    def clear_mask(self) -> None:
+        """Remove all mask overlays."""
+        self._canvas.clear_mask()
+
+    def clear_masks(self) -> None:
+        """Remove all mask overlays."""
+        self._canvas.clear_masks()
 
     def set_xlabel(self, text: str) -> None:
         """Set x-axis label."""
@@ -2830,6 +3160,10 @@ def imagescqt(
     colorbar_label: str = "",
     xaxis: ndarray | None = None,
     yaxis: ndarray | None = None,
+    mask: ndarray | None = None,
+    mask_color: MaskColor = "red",
+    mask_alpha: float = 0.35,
+    mask_label: str | None = None,
 ) -> ImageWindow:
     """
     Display a numpy array in a PySide6 window (MATLAB imagesc style).
@@ -2842,7 +3176,7 @@ def imagescqt(
     data_arg, xaxis_arg, yaxis_arg = _parse_axes_and_data(
         args, xaxis, yaxis, "imagescqt"
     )
-    arr = asarray(data_arg)
+    arr = np.asarray(data_arg)
     if arr.ndim != 2:
         raise ValueError(f"imagescqt expects a 2D array, got shape {arr.shape}")
 
@@ -2866,6 +3200,10 @@ def imagescqt(
         ylabel=ylabel,
         colorbar=colorbar,
         colorbar_label=colorbar_label,
+        mask=mask,
+        mask_color=mask_color,
+        mask_alpha=mask_alpha,
+        mask_label=mask_label,
     )
     window.show()
 

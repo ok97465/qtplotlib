@@ -39,6 +39,16 @@ win.set_ylabel("Depth (m)")
 win.set_colorbar_label("Power (dB)")
 # You can add a colorbar later too:
 win.add_colorbar(label="Added later")
+
+# Colored masks can be overlaid on the grayscale/base image:
+mask = data > np.percentile(data, 90)
+mask_layer = win.add_mask(mask, color="tab:red", alpha=0.35, label="high values")
+mask_layer.set_visible(True)
+mask_layer.set_alpha(0.45)
+# Replace all mask overlays with one layer, or remove them:
+win.set_mask(mask, color="cyan", alpha=0.25)
+win.clear_masks()
+
 # Reduce empty margins similar to matplotlib.tight_layout:
 win.tight_layout(pad=1.05, auto_resize=True)  # w_pad/h_pad/rect also supported
 # Disable or keep window size fixed by turning it off or passing auto_resize=False:
@@ -79,3 +89,9 @@ The helper will attach to an existing Qt application (ideal for `%gui qt`). If n
 `colorbar`:
 - `colorbar=True` to show colorbar; `colorbar_label` to set its label (also enables it).
 - Runtime updates: `win.set_colorbar(True/False)`, `win.set_colorbar_label("Label")`.
+
+`mask` overlays:
+- Initial overlay: `imagescqt(data, cmap="gray", mask=mask, mask_color="tab:red", mask_alpha=0.35)`.
+- Runtime overlays: `win.add_mask(mask, color="cyan", alpha=0.25)` returns a `MaskLayer`.
+- Layer updates: `layer.set_data(mask)`, `layer.set_color("yellow")`, `layer.set_alpha(0.4)`, `layer.set_visible(False)`, `layer.remove()`.
+- Convenience updates: `win.set_mask(mask, color="red", alpha=0.35)` replaces all masks; `win.clear_masks()` removes them.
